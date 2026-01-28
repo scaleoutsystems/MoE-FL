@@ -21,7 +21,7 @@ class Client:
     num_samples: int
     loader: DataLoader
     opt_kwargs: dict
-    opt_state: dict | None = None  # stores optimizer.state_dict() across rounds
+    opt_state: dict | None = None  
     metrics: dict = field(default_factory=dict)
 
 @torch.no_grad()
@@ -116,9 +116,9 @@ def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=Tr
 
             bs = x.size(0)
             running_loss += loss.item() * bs
-            if y.ndim == 2:          # soft labels from MixUp/CutMix: [B, C]
+            if y.ndim == 2:          # soft labels from MixUp/CutMix
                 y_hard = y.argmax(dim=1)
-            else:                    # hard labels: [B]
+            else:                    # hard labels
                 y_hard = y
             correct += (logits.argmax(dim=1) == y_hard).sum().item()
             total += bs

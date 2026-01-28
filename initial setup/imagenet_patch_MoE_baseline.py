@@ -56,12 +56,11 @@ class MoECNBlock(nn.Module):
         self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
 
     def forward(self, input):
-        # input: (N, C, H, W)
-        x = self.dwconv(input)  # (N, H, W, C)
+        x = self.dwconv(input)  
         N, H, W, C = x.shape
-        x_flat = x.reshape(-1, C)  # (T, C), T = N*H*W
+        x_flat = x.reshape(-1, C)  
 
-        topi, weights = self.router(x_flat)  # (T, K), (T, K)
+        topi, weights = self.router(x_flat)  
         T, K = topi.shape
 
         out = x_flat.new_zeros(T, C)
@@ -69,20 +68,19 @@ class MoECNBlock(nn.Module):
         #TODO highly innefficient with nested python loops
         #Improve routing code
         for k in range(K):
-            ids_k = topi[:, k]                   # (T,)
-            w_k = weights[:, k].unsqueeze(1)     # (T, 1)
+            ids_k = topi[:, k]                   
+            w_k = weights[:, k].unsqueeze(1)     
 
-            # For each expert, gather its tokens in one shot, run expert once, scatter back
             for e, expert in enumerate(self.experts):
-                idx = (ids_k == e).nonzero(as_tuple=False).squeeze(1)  # (n_e,)
+                idx = (ids_k == e).nonzero(as_tuple=False).squeeze(1)  
                 if idx.numel() == 0:
                     continue
 
-                y = expert(x_flat.index_select(0, idx))                # (n_e, C)
-                out.index_add_(0, idx, y * w_k.index_select(0, idx))   # scatter-add
+                y = expert(x_flat.index_select(0, idx))                
+                out.index_add_(0, idx, y * w_k.index_select(0, idx))   
 
         out = out.view(N, H, W, C)
-        out = self.permute_back(out)  # (N, C, H, W)
+        out = self.permute_back(out)  
 
         out = self.layer_scale * out
         out = self.stochastic_depth(out)
@@ -107,23 +105,24 @@ class Router(nn.Module):
         self.top_k = top_k
         self.gate = nn.Linear(dim, num_experts, bias=False)
 
-    def forward(self, x):  # x: (T, C)
-        logits = self.gate(x)                       # (T, E)
-        topv, topi = torch.topk(logits, k=self.top_k, dim=-1)  # (T, K), (T, K)
+    #Patch routing
+    def forward(self, x):  
+        logits = self.gate(x)                       
+        topv, topi = torch.topk(logits, k=self.top_k, dim=-1) 
 
         # Turn top-k logits into weights that sum to 1 for each token
-        weights = torch.softmax(topv, dim=-1)       # (T, K)
+        weights = torch.softmax(topv, dim=-1)      
 
         return topi, weights
     
 def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4):
-    # convnext_tiny: stage dim -> number of blocks in that stage
+    # convnext_tiny stage dims and number of blocks
     stage_depth = {96: 3, 192: 3, 384: 9, 768: 3}
 
-    # which stages should get "end-of-stage MoE"
+    # which stages should get MoE
     moe_dims = {384, 768}  # last 2 stages
 
-    # how many blocks we've created so far for each dim
+    # Blocks created for each dim
     seen = {d: 0 for d in stage_depth}
 
     def block(dim, layer_scale, stochastic_depth_prob, norm_layer=None):
@@ -183,7 +182,7 @@ opt_kwargs = {
 dl_kwargs = {
     # "num_workers": 4,
     "pin_memory": (device == "cuda"),
-    # "persistent_workers": True,  # optional
+    # "persistent_workers": True,  
 }
 
 label_smoothing = 0.1
@@ -247,7 +246,7 @@ else:
     train_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 eval_loss_fn  = nn.CrossEntropyLoss()
 
-# ---- Model factory (MoE ConvNeXt Tiny) ----
+# Model factory 
 def model_fn():
     block_factory = make_last_block_moe_factory(
         num_experts=4,
@@ -277,7 +276,7 @@ for r in range(num_rounds):
         local_model = model_fn().to(device)
         local_model.load_state_dict(global_params)
 
-        # Optimizer (persist across rounds via client.opt_state)
+        # Optimizer 
         optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
         if client.opt_state is not None:
             optimizer.load_state_dict(client.opt_state)
@@ -296,11 +295,9 @@ for r in range(num_rounds):
             augment=augment,
         )
 
-        # Save metrics + persist optimizer state
         client.metrics[f"round_{r}"] = hist
         client.opt_state = deepcopy(optimizer.state_dict())
 
-        # Collect for FedAvg
         client_states.append(deepcopy(local_model.state_dict()))
         client_ns.append(client.num_samples)
 

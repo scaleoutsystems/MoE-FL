@@ -39,7 +39,7 @@ opt_kwargs = {
 dl_kwargs = {
     #"num_workers": 4,
     "pin_memory": (device == "cuda"),
-    # "persistent_workers": True,  # optional
+    # "persistent_workers": True, 
 }
 
 label_smoothing = 0.1
@@ -76,7 +76,7 @@ val = Imagenette(root='data',split='val',download=True, transform=val_transform)
 train_eval_loader = DataLoader(train, batch_size=eval_bs, shuffle=False, **dl_kwargs)
 val_loader = DataLoader(val, batch_size=eval_bs, shuffle=False, **dl_kwargs)
 
-# Client loaders (client-side)
+# Client loaders 
 clients = init_clients(
     dataset=train,
     num_clients=num_clients,
@@ -123,14 +123,14 @@ for r in range(num_rounds):
         local_model = model_fn().to(device)
         local_model.load_state_dict(global_params)
 
-        # Optimizer (persist across rounds if you keep client.opt_state)
+        # Optimizer 
         optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
         if client.opt_state is not None:
             optimizer.load_state_dict(client.opt_state)
             
         set_lr(optimizer, lr_r)
 
-        # Train (returns per-epoch metrics)
+        # Train 
         hist = train_client(
             local_model,
             client.loader,
@@ -142,11 +142,9 @@ for r in range(num_rounds):
             augment=augment,
         )
 
-        # Optional: store metrics + persist optimizer state
         client.metrics[f"round_{r}"] = hist
         client.opt_state = deepcopy(optimizer.state_dict())
 
-        # Collect for FedAvg
         client_states.append(deepcopy(local_model.state_dict()))
         client_ns.append(client.num_samples)
 

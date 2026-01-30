@@ -17,23 +17,45 @@ from typing import Callable, Optional
 
 from torch.nn import functional as F
 
-
 #NOTE config convnext
 #Last-2
 #Experts: 4 or 8
 #Top-1 routing (1x1 conv routing)
 #MLP ratio 2 or 4
 #Load balancing as in paper
+
+class MoEConvNeXtWrapper(nn.Module):
+    def __init__(self, base: nn.Module):
+        super().__init__()
+        self.base = base
+        self._aux_modules = [m for m in self.base.modules() if hasattr(m, "aux_loss")]
+
+    def forward(self, x, return_aux: bool = False):
+        logits = self.base(x)
+        if not return_aux:
+            return logits
+        return logits, self.get_aux_loss()
+
+    def get_aux_loss(self):
+        aux = None
+        for m in self._aux_modules:
+            a = m.aux_loss
+            if a is None:
+                continue
+            aux = a if aux is None else aux + a
+        if aux is None:
+            aux = next(self.base.parameters()).new_zeros(())
+        return aux
     
-#MOE ConvNeXt base block for ConvNeXt tiny
-#TODO missing load balancing loss
-class MoECNBlock(nn.Module):
+#TODO load balancing loss Correct?
+#TODO batch prioritized routing correct?
+class MoECNBlock(nn.Module): #(Shazeer 2017 aux loss) TODO: should it be swapped to switch loss instead? (for k=1)
     def __init__(
         self,
-        dim,
-        num_experts,
-        top_k,
-        mlp_ratio,
+        dim: int,
+        num_experts: int,
+        top_k: int,
+        mlp_ratio: int,
         layer_scale: float,
         stochastic_depth_prob: float,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
@@ -47,40 +69,92 @@ class MoECNBlock(nn.Module):
             Permute([0, 2, 3, 1]),
             norm_layer(dim),
         )
-        self.router = Router(dim,num_experts,top_k)
-        
-        self.experts = nn.ModuleList([Expert(dim,mlp_ratio) for _ in range(num_experts)])
+
+        self.router = Router(dim, num_experts, top_k)
+        self.experts = nn.ModuleList([Expert(dim, mlp_ratio) for _ in range(num_experts)])
         self.permute_back = Permute([0, 3, 1, 2])
-        
+        self.aux_loss = torch.tensor(0.0)
+        self.capacity_ratio = 0.8
+
         self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
         self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
+        
+    def _moe_route(self, x_flat, topi, weights, order):
+        T, C = x_flat.shape
+        K = topi.shape[1]
+        E = len(self.experts)
+        device = x_flat.device
 
-    def forward(self, input):
-        x = self.dwconv(input)  
-        N, H, W, C = x.shape
-        x_flat = x.reshape(-1, C)  
+        # Build flattened routes in BPR order
+        token_idx = order.repeat(K) 
 
-        topi, weights = self.router(x_flat)  
-        T, K = topi.shape
+        # expert ids in round order (rank-0 for all tokens, then rank-1, ...)
+        expert_id = topi[order].transpose(0, 1).reshape(-1)  
+
+        # gate weights aligned with expert_id
+        gate_w = weights[order].transpose(0, 1).reshape(-1, 1) 
+
+        # Group by expert id while preserving BPR order inside each expert
+        sort_perm = torch.argsort(expert_id, stable=True)
+        token_idx = token_idx[sort_perm]
+        expert_id = expert_id[sort_perm]
+        gate_w = gate_w[sort_perm]
+
+        Be = int(round((K * T * self.capacity_ratio) / E))
+        assert(Be > 0)
+
+        # Find start index of each expert chunk
+        counts = torch.bincount(expert_id, minlength=E)
+        offsets = torch.cumsum(counts, dim=0)
+        starts = offsets - counts
+
+        # Position of each route within its expert chunk
+        M = expert_id.numel()
+        pos_in_chunk = torch.arange(M, device=device) - starts[expert_id]
+
+        # Keep only first Be routes per expert (highest priority due to BPR ordering)
+        keep = pos_in_chunk < Be
+
+        token_idx = token_idx[keep]
+        expert_id = expert_id[keep]
+        gate_w = gate_w[keep]
 
         out = x_flat.new_zeros(T, C)
 
-        #TODO highly innefficient with nested python loops
-        #Improve routing code
-        for k in range(K):
-            ids_k = topi[:, k]                   
-            w_k = weights[:, k].unsqueeze(1)     
+        # Recompute chunk boundaries after dropping overflow routes
+        counts = torch.bincount(expert_id, minlength=E)
+        offsets = torch.cumsum(counts, dim=0)
 
-            for e, expert in enumerate(self.experts):
-                idx = (ids_k == e).nonzero(as_tuple=False).squeeze(1)  
-                if idx.numel() == 0:
-                    continue
+        start = 0
+        for e, expert in enumerate(self.experts):
+            end = int(offsets[e])
+            if end == start:
+                continue
 
-                y = expert(x_flat.index_select(0, idx))                
-                out.index_add_(0, idx, y * w_k.index_select(0, idx))   
+            idx_e = token_idx[start:end]        # tokens kept for this expert
+            x_e = x_flat.index_select(0, idx_e) # gather tokens
+            y_e = expert(x_e) * gate_w[start:end]
+            out.index_add_(0, idx_e, y_e)
+            start = end
+
+        return out
+
+    def forward(self, input):
+        x = self.dwconv(input)  # (N, H, W, C)
+        N, H, W, C = x.shape
+        x_flat = x.reshape(-1, C)  # [T, C]
+
+        topi, weights, priority, aux_loss = self.router(x_flat, return_aux=self.training)
+        order = torch.argsort(priority, descending=True)
+        out = self._moe_route(x_flat, topi, weights, order)  # [T, C]
+        
+        if aux_loss is None:
+            self.aux_loss = x_flat.new_zeros(())
+        else:
+            self.aux_loss = aux_loss
 
         out = out.view(N, H, W, C)
-        out = self.permute_back(out)  
+        out = self.permute_back(out)  # (N, C, H, W)
 
         out = self.layer_scale * out
         out = self.stochastic_depth(out)
@@ -98,22 +172,96 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.block(x)
     
+def _phi(z):
+    # Standard normal CDF
+    return 0.5 * (1.0 + torch.erf(z / np.sqrt(2.0)))
+
 class Router(nn.Module):
-    def __init__(self, dim: int, num_experts: int, top_k: int = 1):
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        top_k: int = 2,
+        importance_coeff: float = 0.01,
+        load_coeff: float = 0.01,
+        eps: float = 1e-9,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.importance_coeff = importance_coeff
+        self.load_coeff = load_coeff
+        self.eps = eps
+
+        # W_g and W_noise #TODO init as zeros?
         self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.noise = nn.Linear(dim, num_experts, bias=False)
 
-    #Patch routing
-    def forward(self, x):  
-        logits = self.gate(x)                       
+    @staticmethod
+    def _cv_squared(x, eps = 1e-9):
+        mean = x.mean()
+        var = (x - mean).pow(2).mean()  
+        return var / (mean * mean + eps)
+
+    def _importance_loss(self, logits):
+        probs = torch.softmax(logits, dim=-1)  
+        importance = probs.sum(dim=0)         
+        return self.importance_coeff * self._cv_squared(importance, self.eps)
+
+    def _load_loss(self, x, logits):
+        B, E = logits.shape
+        k = self.top_k
+
+        noise_std = F.softplus(self.noise(x)) + self.eps 
+
+        # kth and (k+1)th largest per token
+        top_vals, top_idx = logits.topk(k + 1, dim=-1)    
+        v_k = top_vals[:, k - 1]                          
+        v_kplus = top_vals[:, k]                         
+
+        # membership mask for top-k (not k+1)
+        in_topk = torch.zeros(B, E, device=logits.device, dtype=torch.bool)
+        in_topk.scatter_(1, top_idx[:, :k], True)
+
+        kth_excl = torch.where(
+            in_topk,
+            v_kplus.unsqueeze(-1).expand_as(logits),  # if in top-k, exclude => use (k+1)th
+            v_k.unsqueeze(-1).expand_as(logits),      # else use kth
+        )
+
+        z = (logits - kth_excl) / noise_std
+        P = _phi(z)              
+        load = P.sum(dim=0)       
+        return self.load_coeff * self._cv_squared(load, self.eps)
+
+    def forward(self, x, return_aux = True):
+        orig_shape = x.shape
+        x2 = x.reshape(-1, orig_shape[-1])     
+
+        logits = self.gate(x2)                  
+
+        probs = torch.softmax(logits, dim=-1) # routing weights w_{e,p}
+        priority = probs.max(dim=-1).values     
+
         topv, topi = torch.topk(logits, k=self.top_k, dim=-1) 
+        weights = torch.softmax(topv, dim=-1)                  
 
-        # Turn top-k logits into weights that sum to 1 for each token
-        weights = torch.softmax(topv, dim=-1)      
+        if return_aux and (self.importance_coeff != 0.0 or self.load_coeff != 0.0):
+            aux = logits.new_zeros(())
+            if self.importance_coeff != 0.0:
+                aux = aux + self._importance_loss(logits)
+            if self.load_coeff != 0.0:
+                aux = aux + self._load_loss(x2, logits)
+            aux_loss = aux
+        else:
+            aux_loss = None
 
-        return topi, weights
+        leading = orig_shape[:-1]
+        topi = topi.view(*leading, self.top_k)
+        weights = weights.view(*leading, self.top_k)
+
+        
+        return topi, weights, priority, aux_loss
     
 def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4):
     # convnext_tiny stage dims and number of blocks
@@ -189,7 +337,7 @@ label_smoothing = 0.1
 
 val_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
+    transforms.CenterCrop(32),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -200,7 +348,7 @@ val_transform = transforms.Compose([
 #TODO papers may use more regularization
 train_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
+    transforms.CenterCrop(32),
     transforms.RandAugment(num_ops=9, magnitude=5),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -253,7 +401,7 @@ def model_fn():
         top_k=1,
         mlp_ratio=4,
     )
-    return convnext_tiny(weights=None, num_classes=10, block=block_factory)
+    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=10, block=block_factory))
 
 global_model = model_fn().to(device)
 global_params = deepcopy(global_model.state_dict())

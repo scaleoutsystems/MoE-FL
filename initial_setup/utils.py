@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from torchvision.transforms.v2 import MixUp, CutMix
 from torchvision.transforms.v2 import RandomChoice
 
-mix_transform = RandomChoice([
-    MixUp(num_classes=10),
-    CutMix(num_classes=10)
+mix_transform = RandomChoice([ 
+    MixUp(num_classes=10,alpha=0.8),
+    CutMix(num_classes=10,alpha=1.0)
 ])
 
 @dataclass
@@ -109,8 +109,16 @@ def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=Tr
                 x, y = mix_transform(x, y)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            # Get extra losses in case they exist
+            if hasattr(model, "get_aux_loss"):
+                logits, aux = model(x, return_aux=True)
+                main_loss = loss_fn(logits, y)
+                loss = main_loss + aux
+            else:
+                logits = model(x)
+                loss = loss_fn(logits, y)
+            # logits = model(x)
+            # loss = loss_fn(logits, y)
             loss.backward()
             optimizer.step()
 

@@ -148,6 +148,7 @@ for r in range(num_rounds):
         client_states.append(deepcopy(local_model.state_dict()))
         client_ns.append(client.num_samples)
 
+    print("now")
     # Aggregate
     global_params = fedavg(client_states, client_ns)
     global_model.load_state_dict(global_params)

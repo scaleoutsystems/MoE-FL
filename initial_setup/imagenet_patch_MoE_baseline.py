@@ -10,7 +10,7 @@ from torchvision.models.convnext import ConvNeXt, CNBlock
 from torchvision.ops import StochasticDepth, Permute
 from torchvision import transforms
 from copy import deepcopy
-from utils import fedavg, init_clients, train_client, evaluate, measure_ms_per_sample, fedavg_comm_cost_bytes, lr_schedule, ema_update_model
+from utils import fedavg, init_clients, train_client, evaluate, measure_ms_per_sample, fedavg_comm_cost_mb, lr_schedule, ema_update_model
 from timm.loss import SoftTargetCrossEntropy
 from functools import partial
 from typing import Callable, Optional
@@ -22,7 +22,7 @@ from torch.nn import functional as F
 #Experts: 4 or 8
 #Top-1 routing (1x1 conv routing)
 #MLP ratio 2 or 4
-#Load balancing as in paper
+#Load balancing and routing as in paper 
 
 class MoEConvNeXtWrapper(nn.Module):
     def __init__(self, base: nn.Module):
@@ -49,7 +49,8 @@ class MoEConvNeXtWrapper(nn.Module):
     
 #TODO load balancing loss Correct?
 #TODO batch prioritized routing correct?
-class MoECNBlock(nn.Module): #(Shazeer 2017 aux loss) TODO: should it be swapped to switch loss instead? (for k=1)
+#(Shazeer 2017 aux loss) TODO: should it be swapped to switch loss instead? (for k=1)
+class MoECNBlock(nn.Module): 
     def __init__(
         self,
         dim: int,
@@ -171,10 +172,6 @@ class Expert(nn.Module):
 
     def forward(self, x):
         return self.block(x)
-    
-def _phi(z):
-    # Standard normal CDF
-    return 0.5 * (1.0 + torch.erf(z / np.sqrt(2.0)))
 
 class Router(nn.Module):
     def __init__(
@@ -182,8 +179,8 @@ class Router(nn.Module):
         dim: int,
         num_experts: int,
         top_k: int = 2,
-        importance_coeff: float = 0.01,
-        load_coeff: float = 0.01,
+        importance_coeff: float = 0.1,
+        load_coeff: float = 0.1,
         eps: float = 1e-9,
     ):
         super().__init__()
@@ -193,74 +190,89 @@ class Router(nn.Module):
         self.load_coeff = load_coeff
         self.eps = eps
 
-        # W_g and W_noise #TODO init as zeros?
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.noise = nn.Linear(dim, num_experts, bias=False)
+        #Shazeer suggests initializing these as zeros
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.noise.weight)
 
+    @staticmethod
+    def _phi(z):
+        # Standard normal CDF
+        return 0.5 * (1.0 + torch.erf(z / np.sqrt(2.0)))
+    
     @staticmethod
     def _cv_squared(x, eps = 1e-9):
         mean = x.mean()
         var = (x - mean).pow(2).mean()  
         return var / (mean * mean + eps)
 
-    def _importance_loss(self, logits):
-        probs = torch.softmax(logits, dim=-1)  
-        importance = probs.sum(dim=0)         
+    def _importance_loss(self, gates_full):
+        importance = gates_full.sum(dim=0)      
         return self.importance_coeff * self._cv_squared(importance, self.eps)
-
-    def _load_loss(self, x, logits):
-        B, E = logits.shape
+    
+    def _load_loss(self, logits_clean, noise_std, noisy_logits):
+        B, E = logits_clean.shape
         k = self.top_k
 
-        noise_std = F.softplus(self.noise(x)) + self.eps 
+        # kth and (k+1)th largest per token from noisy logits (matches routing)
+        top_vals, top_idx = noisy_logits.topk(k + 1, dim=-1)
+        v_k = top_vals[:, k - 1]
+        v_kplus = top_vals[:, k]
 
-        # kth and (k+1)th largest per token
-        top_vals, top_idx = logits.topk(k + 1, dim=-1)    
-        v_k = top_vals[:, k - 1]                          
-        v_kplus = top_vals[:, k]                         
-
-        # membership mask for top-k (not k+1)
-        in_topk = torch.zeros(B, E, device=logits.device, dtype=torch.bool)
+        in_topk = torch.zeros(B, E, device=noisy_logits.device, dtype=torch.bool)
         in_topk.scatter_(1, top_idx[:, :k], True)
 
         kth_excl = torch.where(
             in_topk,
-            v_kplus.unsqueeze(-1).expand_as(logits),  # if in top-k, exclude => use (k+1)th
-            v_k.unsqueeze(-1).expand_as(logits),      # else use kth
+            v_kplus.unsqueeze(-1).expand_as(noisy_logits),
+            v_k.unsqueeze(-1).expand_as(noisy_logits),
         )
 
-        z = (logits - kth_excl) / noise_std
-        P = _phi(z)              
-        load = P.sum(dim=0)       
+        z = (logits_clean - kth_excl) / (noise_std + self.eps)
+        P = self._phi(z)
+        load = P.sum(dim=0)
         return self.load_coeff * self._cv_squared(load, self.eps)
-
-    def forward(self, x, return_aux = True):
+    
+    def forward(self, x, return_aux=True):
         orig_shape = x.shape
-        x2 = x.reshape(-1, orig_shape[-1])     
+        x2 = x.reshape(-1, orig_shape[-1])
 
-        logits = self.gate(x2)                  
+        logits = self.gate(x2)  # clean logits
+        noise_std = F.softplus(self.noise(x2)) + self.eps
 
-        probs = torch.softmax(logits, dim=-1) # routing weights w_{e,p}
-        priority = probs.max(dim=-1).values     
+        # Only add noise during training
+        if self.training:
+            noisy_logits = logits + torch.randn_like(logits) * noise_std
+        else:
+            noisy_logits = logits
 
-        topv, topi = torch.topk(logits, k=self.top_k, dim=-1) 
-        weights = torch.softmax(topv, dim=-1)                  
+        # Shazeer KeepTopK(noisy_logits) then softmax
+        topv, topi = noisy_logits.topk(self.top_k, dim=-1)
+        masked = noisy_logits.new_full(noisy_logits.shape, float("-inf"))
+        masked.scatter_(1, topi, topv)
 
-        if return_aux and (self.importance_coeff != 0.0 or self.load_coeff != 0.0):
+        gates_full = torch.softmax(masked, dim=-1)
+        weights = gates_full.gather(1, topi)
+
+        # BPR priority
+        priority = weights.max(dim=-1).values
+
+        # aux losses only in training
+        aux_loss = None
+        if return_aux and self.training and (self.importance_coeff != 0.0 or self.load_coeff != 0.0):
             aux = logits.new_zeros(())
             if self.importance_coeff != 0.0:
-                aux = aux + self._importance_loss(logits)
+                aux = aux + self._importance_loss(gates_full)   # uses sparse gates
             if self.load_coeff != 0.0:
-                aux = aux + self._load_loss(x2, logits)
+                aux = aux + self._load_loss(logits, noise_std, noisy_logits)  # uses noisy threshold
             aux_loss = aux
-        else:
-            aux_loss = None
 
         leading = orig_shape[:-1]
         topi = topi.view(*leading, self.top_k)
         weights = weights.view(*leading, self.top_k)
+        priority = priority.view(*leading)
 
-        
         return topi, weights, priority, aux_loss
     
 def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4):
@@ -337,7 +349,7 @@ label_smoothing = 0.1
 
 val_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(32),
+    transforms.CenterCrop(64),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -348,7 +360,7 @@ val_transform = transforms.Compose([
 #TODO papers may use more regularization
 train_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(32),
+    transforms.CenterCrop(64),
     transforms.RandAugment(num_ops=9, magnitude=5),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -359,7 +371,7 @@ train_transform = transforms.Compose([
 ])
 
 train = Imagenette(root="data", split="train", download=True, transform=train_transform)
-val   = Imagenette(root="data", split="val",   download=True, transform=val_transform)
+val = Imagenette(root="data", split="val",   download=True, transform=val_transform)
 
 # Global eval loaders
 train_eval_loader = DataLoader(train, batch_size=eval_bs, shuffle=False, **dl_kwargs)
@@ -398,7 +410,7 @@ eval_loss_fn  = nn.CrossEntropyLoss()
 def model_fn():
     block_factory = make_last_block_moe_factory(
         num_experts=4,
-        top_k=1,
+        top_k=2,
         mlp_ratio=4,
     )
     return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=10, block=block_factory))
@@ -478,4 +490,6 @@ print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc
 lat_mean, lat_std = measure_ms_per_sample(global_model, val_loader, device)
 print(f"Latency: {lat_mean:.3f} +/- {lat_std:.3f} ms/sample (batch_size = {eval_bs})")
 
-print(fedavg_comm_cost_bytes(global_model, num_clients=num_clients, num_rounds=num_rounds))
+print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
+
+#TODO add logging and model checkpointing for training

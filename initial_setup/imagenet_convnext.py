@@ -8,7 +8,7 @@ from torchvision.models import convnext_tiny
 from torchvision import transforms
 from timm.loss import SoftTargetCrossEntropy
 from copy import deepcopy
-from utils import fedavg, init_clients, train_client, evaluate, measure_ms_per_sample, fedavg_comm_cost_bytes, lr_schedule, ema_update_model
+from utils import fedavg, init_clients, train_client, evaluate, measure_ms_per_sample, fedavg_comm_cost_mb, lr_schedule, ema_update_model
 
 #Reproducability and GPU
 seed=42
@@ -172,6 +172,6 @@ print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc
 lat_mean, lat_std = measure_ms_per_sample(global_model, val_loader, device)
 print(f"Latency: {lat_mean:.3f} +/- {lat_std:.3f} ms/sample (batch_size = {eval_bs})")
 
-print(fedavg_comm_cost_bytes(global_model, num_clients=num_clients, num_rounds=num_rounds))
+print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
 
 #TODO Data augmentation (paper might use more?)

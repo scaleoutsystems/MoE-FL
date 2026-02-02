@@ -1,1 +1,0 @@
-#mobile v-moe implementation

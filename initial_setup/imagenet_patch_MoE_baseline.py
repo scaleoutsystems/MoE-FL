@@ -11,6 +11,7 @@ from torchvision.ops import StochasticDepth, Permute
 from torchvision import transforms
 from copy import deepcopy
 from utils import fedavg, init_clients, train_client, evaluate, measure_ms_per_sample, fedavg_comm_cost_mb, lr_schedule, ema_update_model
+from experiment_tracking import init_run, log_and_checkpoint
 from timm.loss import SoftTargetCrossEntropy
 from functools import partial
 from typing import Callable, Optional
@@ -75,7 +76,7 @@ class MoECNBlock(nn.Module):
         self.experts = nn.ModuleList([Expert(dim, mlp_ratio) for _ in range(num_experts)])
         self.permute_back = Permute([0, 3, 1, 2])
         self.aux_loss = torch.tensor(0.0)
-        self.capacity_ratio = 0.8
+        self.capacity_ratio = 1
 
         self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
         self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
@@ -349,7 +350,7 @@ label_smoothing = 0.1
 
 val_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
+    transforms.CenterCrop(32),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -357,18 +358,51 @@ val_transform = transforms.Compose([
     ),
 ])
 
+num_ops = 9
+magnitude = 5
+rand_erase_p = 0.25
+
 #TODO papers may use more regularization
 train_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
-    transforms.RandAugment(num_ops=9, magnitude=5),
+    transforms.CenterCrop(32),
+    #transforms.RandAugment(num_ops=num_ops, magnitude=magnitude),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     ),
-    transforms.RandomErasing(p=0.25),
+    #transforms.RandomErasing(p=rand_erase_p),
 ])
+
+ema_decay = 0.995
+augment = False
+num_experts = 4
+top_k = 2
+mlp_ratio = 4
+
+config = {
+    "seed": seed,
+    "num_clients": num_clients,
+    "num_rounds": num_rounds,
+    "local_epochs": local_epochs,
+    "train_bs": train_bs,
+    "eval_bs": eval_bs,
+    "base_lr": base_lr,
+    "start_lr": start_lr,
+    "warmup_rounds": warmup_rounds,
+    "opt_kwargs": opt_kwargs,
+    "ema_decay": ema_decay,
+    "mixup/cutmix": {"augment": augment,"mixup_alpha": 0.8, "cutmix_alpha": 1.0},
+    "RandAugment": {"num_ops": num_ops, "magnitude": magnitude},
+    "RandomErasing_p": rand_erase_p,
+    "moe": {"num_experts": num_experts, "top_k": top_k, "mlp_ratio": mlp_ratio},
+    "label_smoothing": label_smoothing
+}
+
+
+ctx = init_run("imagenette_fl_moe", config)
+print("Run dir:", ctx["run_dir"])
 
 train = Imagenette(root="data", split="train", download=True, transform=train_transform)
 val = Imagenette(root="data", split="val",   download=True, transform=val_transform)
@@ -399,7 +433,6 @@ lr_sched = lr_schedule(
     start_lr=start_lr,
 )
 
-augment = True
 if augment:
     train_loss_fn = SoftTargetCrossEntropy()
 else:
@@ -409,9 +442,9 @@ eval_loss_fn  = nn.CrossEntropyLoss()
 # Model factory 
 def model_fn():
     block_factory = make_last_block_moe_factory(
-        num_experts=4,
-        top_k=2,
-        mlp_ratio=4,
+        num_experts=num_experts,
+        top_k=top_k,
+        mlp_ratio=mlp_ratio,
     )
     return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=10, block=block_factory))
 
@@ -419,7 +452,6 @@ global_model = model_fn().to(device)
 global_params = deepcopy(global_model.state_dict())
 
 # EMA model
-ema_decay = 0.995
 ema_model = model_fn().to(device)
 ema_model.load_state_dict(global_model.state_dict())
 ema_model.eval()
@@ -480,6 +512,23 @@ for r in range(num_rounds):
             f"val loss {va['loss']:.4f} acc {va['acc']:.4f} | "
             f"EMA val loss {va_ema['loss']:.4f} acc {va_ema['acc']:.4f}"
         )
+        
+        metrics = {
+            "lr": lr_r,
+            "train_loss": float(tr["loss"]),
+            "train_acc": float(tr["acc"]),
+            "val_loss": float(va["loss"]),
+            "val_acc": float(va["acc"]),
+            "val_ema_loss": float(va_ema["loss"]),
+            "val_ema_acc": float(va_ema["acc"]),
+        }
+
+        saved = log_and_checkpoint(ctx,r,metrics,global_model,
+                                   ema_model,clients,
+                                   best_key="val_acc", mode="max",)
+
+        if saved:
+            print(f"New best at round {r}: {metrics['val_acc']:.4f}")
 
 # Final eval
 tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
@@ -491,5 +540,3 @@ lat_mean, lat_std = measure_ms_per_sample(global_model, val_loader, device)
 print(f"Latency: {lat_mean:.3f} +/- {lat_std:.3f} ms/sample (batch_size = {eval_bs})")
 
 print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
-
-#TODO add logging and model checkpointing for training

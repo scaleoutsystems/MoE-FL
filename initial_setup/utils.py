@@ -9,11 +9,6 @@ from dataclasses import dataclass, field
 from torchvision.transforms.v2 import MixUp, CutMix
 from torchvision.transforms.v2 import RandomChoice
 
-mix_transform = RandomChoice([ 
-    MixUp(num_classes=10,alpha=0.8),
-    CutMix(num_classes=10,alpha=1.0)
-])
-
 @dataclass
 class Client:
     cid: int
@@ -91,6 +86,11 @@ def init_clients(dataset,num_clients,batch_size,
                               opt_kwargs=deepcopy(opt_kwargs)))
 
     return clients
+
+mix_transform = RandomChoice([ 
+    MixUp(num_classes=10,alpha=0.8),
+    CutMix(num_classes=10,alpha=1.0)
+])
 
 def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=True, augment=True):
     model.train()

@@ -6,7 +6,7 @@ import numpy as np
 import random
 from torchvision.datasets import Imagenette
 from torchvision.models import convnext_tiny 
-from torchvision.models.convnext import ConvNeXt, CNBlock
+from torchvision.models.convnext import CNBlock
 from torchvision.ops import StochasticDepth, Permute
 from torchvision import transforms
 from copy import deepcopy
@@ -15,7 +15,6 @@ from experiment_tracking import init_run, log_and_checkpoint
 from timm.loss import SoftTargetCrossEntropy
 from functools import partial
 from typing import Callable, Optional
-
 from torch.nn import functional as F
 
 #NOTE config convnext
@@ -73,7 +72,7 @@ class MoECNBlock(nn.Module):
         )
 
         self.router = Router(dim, num_experts, top_k)
-        self.experts = nn.ModuleList([Expert(dim, mlp_ratio) for _ in range(num_experts)])
+        self.experts = nn.ModuleList([ConvNeXtExpert(dim, mlp_ratio) for _ in range(num_experts)])
         self.permute_back = Permute([0, 3, 1, 2])
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = 1
@@ -162,7 +161,7 @@ class MoECNBlock(nn.Module):
         out = self.stochastic_depth(out)
         return input + out
     
-class Expert(nn.Module):
+class ConvNeXtExpert(nn.Module):
     def __init__(self, dim, mlp_ratio):
         super().__init__()
         self.block = nn.Sequential(
@@ -379,7 +378,7 @@ ema_decay = 0.995
 augment = False
 num_experts = 4
 top_k = 2
-mlp_ratio = 4
+mlp_ratio = 2
 
 config = {
     "seed": seed,
@@ -400,8 +399,7 @@ config = {
     "label_smoothing": label_smoothing
 }
 
-
-ctx = init_run("imagenette_fl_moe", config)
+ctx = init_run("imagenette_convnext_fl_moe", config)
 print("Run dir:", ctx["run_dir"])
 
 train = Imagenette(root="data", split="train", download=True, transform=train_transform)

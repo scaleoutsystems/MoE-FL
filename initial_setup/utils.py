@@ -8,6 +8,7 @@ from torch.utils.data import Subset, DataLoader
 from dataclasses import dataclass, field
 from torchvision.transforms.v2 import MixUp, CutMix
 from torchvision.transforms.v2 import RandomChoice
+from fvcore.nn import FlopCountAnalysis, flop_count_table
 
 @dataclass
 class Client:
@@ -261,3 +262,17 @@ def fedavg_comm_cost_mb(model, num_clients, num_rounds, bytes_per_param=4):
         "total_per_round_MB": to_mb(total_per_round),
         "total_training_MB": to_mb(total_training),
     }
+
+def count_flops(model,inputs,show_table=False,max_depth=4,):
+    model.eval()
+    with torch.no_grad():
+        flops = FlopCountAnalysis(model, inputs)
+        #This returns MACs (FLOP not well defined according to docs)
+        macs = flops.total()
+        #Convert to FLOPs
+        flops = 2*macs
+
+        if show_table:
+            print(flop_count_table(flops, max_depth=max_depth))
+
+    return macs, flops

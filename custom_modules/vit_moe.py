@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import timm
-from routers import NoisyTopKRouter
-from patch_dispatcher import PatchDispatcher
+from .routers import NoisyTopKRouter
+from .patch_dispatcher import PatchDispatcher
 
 class MoEViTWrapper(nn.Module):
     def __init__(self, base: nn.Module):

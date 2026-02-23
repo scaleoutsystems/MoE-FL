@@ -24,7 +24,7 @@ print("Running on:", device)
 
 #Hyperparameters
 num_clients = 10
-num_rounds = 300
+num_rounds = 0#300
 local_epochs = 1
 
 train_bs = 32
@@ -53,7 +53,7 @@ label_smoothing = 0.1
 #Transforms 
 val_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -68,7 +68,7 @@ rand_erase_p = 0.25
 
 train_transform = transforms.Compose([
     transforms.Resize(236),
-    transforms.CenterCrop(64),
+    transforms.CenterCrop(224),
     #transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
     transforms.RandAugment(num_ops=num_ops, magnitude=magnitude),
     transforms.ToTensor(),
@@ -218,11 +218,19 @@ for r in range(num_rounds):
         if saved:
             print(f"New best at round {r}: {metrics['val_acc']:.4f}")
 
-tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
-va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
-print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+# tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
+# va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+# print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
+# print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
 
-print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
+# print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
+
+x, _ = next(iter(val_loader))
+x = x[:1].contiguous()  # [1, C, H, W]
+x = x.to(device)
+global_model = global_model.to(device).eval()
+
+macs = count_flops(global_model, x, show_table=True)
+print(macs)
 
 #TODO Data augmentation (paper might use more?)

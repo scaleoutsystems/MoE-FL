@@ -4,6 +4,7 @@ from functools import partial
 from typing import Callable, Optional
 from torchvision.ops import StochasticDepth, Permute
 from .routers import NoisyTopKRouter
+from .patch_dispatcher import PatchDispatcher
 from torchvision.models.convnext import CNBlock
 from torchvision.models import convnext_tiny 
 
@@ -30,7 +31,7 @@ class MoEConvNeXtWrapper(nn.Module):
             aux = next(self.base.parameters()).new_zeros(())
         return aux
 
-class MoECNBlock(nn.Module): 
+class MoECNBlock(nn.Module, PatchDispatcher): 
     def __init__(
         self,
         dim: int,
@@ -41,7 +42,7 @@ class MoECNBlock(nn.Module):
         layer_scale: float,
         stochastic_depth_prob: float,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
-    ) -> None:
+    ):
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -60,68 +61,7 @@ class MoECNBlock(nn.Module):
         self.num_experts = num_experts
 
         self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
-        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
-        
-    def _moe_route(self, x_flat, topi, weights, order):
-        T, C = x_flat.shape
-        K = topi.shape[1]
-        E = self.num_experts
-        device = x_flat.device
-
-        # Build flattened routes in BPR order
-        token_idx = order.repeat(K) 
-
-        # expert ids in round order (rank-0 for all tokens, then rank-1, ...)
-        expert_id = topi[order].transpose(0, 1).reshape(-1)  
-
-        # gate weights aligned with expert_id
-        gate_w = weights[order].transpose(0, 1).reshape(-1, 1) 
-
-        # Group by expert id while preserving BPR order inside each expert
-        sort_perm = torch.argsort(expert_id, stable=True)
-        token_idx = token_idx[sort_perm]
-        expert_id = expert_id[sort_perm]
-        gate_w = gate_w[sort_perm]
-
-        #Be = int(round((K * T * self.capacity_ratio) / E))
-        Be = int((K * T * self.capacity_ratio) / E + 0.5)
-        assert(Be > 0)
-
-        # Find start index of each expert chunk
-        counts = torch.bincount(expert_id, minlength=E)
-        offsets = torch.cumsum(counts, dim=0)
-        starts = offsets - counts
-
-        # Position of each route within its expert chunk
-        M = expert_id.numel()
-        pos_in_chunk = torch.arange(M, device=device) - starts[expert_id]
-
-        # Keep only first Be routes per expert (highest priority due to BPR ordering)
-        keep = pos_in_chunk < Be
-
-        token_idx = token_idx[keep]
-        expert_id = expert_id[keep]
-        gate_w = gate_w[keep]
-
-        out = x_flat.new_zeros(T, C)
-
-        # Recompute chunk boundaries after dropping overflow routes
-        counts = torch.bincount(expert_id, minlength=E)
-        offsets = torch.cumsum(counts, dim=0)
-
-        start = 0
-        for e, expert in enumerate(self.experts):
-            end = int(offsets[e])
-            if end == start:
-                continue
-
-            idx_e = token_idx[start:end]        # tokens kept for this expert
-            x_e = x_flat.index_select(0, idx_e) # gather tokens
-            y_e = expert(x_e) * gate_w[start:end]
-            out.index_add_(0, idx_e, y_e)
-            start = end
-
-        return out
+        #self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
 
     def forward(self, input):
         x = self.dwconv(input)  # (N, H, W, C)
@@ -130,19 +70,23 @@ class MoECNBlock(nn.Module):
 
         topi, weights, priority, aux_loss = self.router(x_flat, return_aux=self.training)
         order = torch.argsort(priority, descending=True)
-        out = self._moe_route(x_flat, topi, weights, order)  # [T, C]
+        moe_flat = self.moe_route(x_flat, topi, weights, order)  # [T, C]
         
         if aux_loss is None:
             self.aux_loss = x_flat.new_zeros(())
         else:
             self.aux_loss = aux_loss
+            
+        #Additional skip connection described in paper       
+        x_skip = self.permute_back(x)
 
-        out = out.view(N, H, W, C)
-        out = self.permute_back(out)  # (N, C, H, W)
+        moe_out = moe_flat.view(N, H, W, C)
+        moe_out = self.permute_back(moe_out)  # (N, C, H, W)
 
-        out = self.layer_scale * out
-        out = self.stochastic_depth(out)
-        return input + out
+        moe_out = self.layer_scale * moe_out
+        #moe_out = self.stochastic_depth(moe_out)
+        
+        return input + x_skip + moe_out
     
 class ConvNeXtExpert(nn.Module):
     def __init__(self, dim, mlp_ratio):

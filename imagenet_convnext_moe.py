@@ -30,7 +30,7 @@ print("Running on:", device)
 
 # Hyperparameters
 num_clients = 10
-num_rounds = 300
+num_rounds = 1#300
 local_epochs = 1
 
 train_bs = 32
@@ -91,7 +91,7 @@ mix_transform = RandomChoice([
 
 ema_decay = 0.995
 num_experts = 4
-top_k = 2
+top_k = 1
 mlp_ratio = 2
 capacity_ratio = 1.0
 
@@ -153,11 +153,11 @@ else:
     train_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 eval_loss_fn  = nn.CrossEntropyLoss()
 
-global_model = convnext_moe_model_fn().to(device)
+global_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
 global_params = deepcopy(global_model.state_dict())
 
 # EMA model
-ema_model = convnext_moe_model_fn().to(device)
+ema_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
 ema_model.load_state_dict(global_model.state_dict())
 ema_model.eval()
 
@@ -170,7 +170,7 @@ for r in range(num_rounds):
 
     for client in clients:
         # Local model starts from current global
-        local_model = convnext_moe_model_fn().to(device)
+        local_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
         local_model.load_state_dict(global_params)
 
         # Optimizer 
@@ -240,5 +240,12 @@ tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
 va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
 print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
 print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+
+x, _ = next(iter(val_loader))
+x = x[:1].contiguous()  # [1, C, H, W]
+x = x.to(device)
+global_model = global_model.to(device).eval()
+
+macs = count_flops(global_model, x, show_table=True)
 
 print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))

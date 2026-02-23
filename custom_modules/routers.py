@@ -3,7 +3,6 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-
 #Shazeer 2017 router
 class NoisyTopKRouter(nn.Module):
     def __init__(
@@ -31,7 +30,7 @@ class NoisyTopKRouter(nn.Module):
     @staticmethod
     def _phi(z):
         # Standard normal CDF
-        return 0.5 * (1.0 + torch.erf(z / np.sqrt(2.0)))
+        return 0.5 * (1.0 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
     
     @staticmethod
     def _cv_squared(x, eps = 1e-9):
@@ -105,4 +104,64 @@ class NoisyTopKRouter(nn.Module):
         weights = weights.view(*leading, self.top_k)
         priority = priority.view(*leading)
 
+        return topi, weights, priority, aux_loss
+    
+    
+#Switch router from paper
+class SwitchRouter(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        load_coeff: float = 0.1,
+        eps: float = 1e-9,
+        jitter_eps: float = 1e-2,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = 1 #Routing designed for Top-1
+        self.load_coeff = load_coeff
+        self.eps = eps
+        self.jitter_eps = jitter_eps
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        #Initialize with small weights 
+        std = (0.1 / dim) ** 0.5
+        nn.init.normal_(self.gate.weight, mean=0.0, std=std)
+        
+    def _load_loss(self, probs, top1):
+        B, E = probs.shape
+
+        # f_i: fraction of tokens routed to expert i (hard counts)
+        counts = torch.bincount(top1, minlength=E).float()        
+        f = counts / (B + self.eps)                                   
+        # p_i: mean probability mass for expert i 
+        p = probs.mean(dim=0)                                
+
+        return self.load_coeff * (E * torch.sum(f * p))
+
+    
+    def forward(self, x, return_aux=True):
+        T, _ = x.shape
+        
+        if self.training and self.jitter_eps > 0:
+            # multiplicative uniform noise for exploration
+            x = x * (1.0 + (2.0 * torch.rand_like(x) - 1.0) * self.jitter_eps)
+        
+        #Compute probabiliities
+        logits = self.gate(x)                 
+        probs = F.softmax(logits, dim=-1)     
+
+        #Get Top-1
+        top1 = torch.argmax(probs, dim=-1)    
+        top1_prob = probs.gather(1, top1[:, None]).squeeze(1) 
+        topi = top1[:, None]                 
+        weights = top1_prob[:, None]         
+
+        #Randomize so overflow does not always drop the same tokens
+        priority = -torch.arange(T, device=x.device, dtype=x.dtype)
+
+        #Add aux_loss if set to true
+        aux_loss = self._load_loss(probs, top1) if (return_aux and self.training) else None
+        
         return topi, weights, priority, aux_loss

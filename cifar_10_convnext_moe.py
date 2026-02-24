@@ -119,8 +119,3 @@ tr = evaluate(global_model, train_eval_loader, device, loss_fn=loss_fn)
 va = evaluate(global_model, val_loader, device, loss_fn=loss_fn)
 print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
 print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
-
-lat_mean, lat_std = measure_ms_per_sample(global_model, val_loader, device)
-print(f"Latency: {lat_mean:.3f} +/- {lat_std:.3f} ms/sample (batch_size = {eval_bs})")
-
-print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))

@@ -147,7 +147,7 @@ lr_sched = lr_schedule(
     start_lr=start_lr,
 )
 
-if mix_transform != None:
+if mix_transform is not None:
     train_loss_fn = SoftTargetCrossEntropy()
 else:
     train_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)

@@ -14,8 +14,9 @@ class Client:
     opt_state: dict | None = None  
     metrics: dict = field(default_factory=dict)
 
+#Allows for batchnorm (not ideal in FL setup)
 @torch.no_grad()
-def fedavg(client_states, client_num_samples):
+def fedavg_batchnorm(client_states, client_num_samples):
     total = sum(client_num_samples)
     weights = [n / total for n in client_num_samples]
 
@@ -30,6 +31,25 @@ def fedavg(client_states, client_num_samples):
         for w, sd in zip(weights[1:], client_states[1:]):
             agg_k += sd[k].detach() * w
         agg[k] = agg_k
+
+    return agg
+
+#Assumes we are not using BatchNorm (which is true for convnext)
+@torch.no_grad()
+def fedavg(client_states, client_num_samples, device=None):
+    total = float(sum(client_num_samples))
+
+    weights = [n / total for n in client_num_samples]
+
+    #Ensure work is done on correct device
+    device = torch.device(device)
+
+    agg = {}
+    for k, t0 in client_states[0].items():
+        acc = torch.zeros_like(t0, device=device, dtype=torch.float32)
+        for w, sd in zip(weights, client_states):
+            acc.add_(sd[k].to(device=device, dtype=torch.float32), alpha=w)
+        agg[k] = acc.to(dtype=t0.dtype)
 
     return agg
 

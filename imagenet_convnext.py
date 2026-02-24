@@ -1,18 +1,19 @@
+import random
+import math
 import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-import random
-from torchvision.datasets import Imagenette
+from torchvision.datasets import Imagenette, ImageNet
 from torchvision.models import convnext_tiny
 from torchvision import transforms
+from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 from timm.loss import SoftTargetCrossEntropy
 from copy import deepcopy
 from utils.fl_utils import fedavg, init_clients, ema_update_model, lr_schedule
-from utils.training_utils import train_client, evaluate
+from utils.training_utils import train_client,train_client_fedprox, evaluate
 from utils.metric_utils import  fedavg_comm_cost_mb, count_flops
 from utils.experiment_tracking import init_run, log_and_checkpoint
-from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
 #Reproducability and GPU
 seed=42
@@ -23,12 +24,12 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 #Hyperparameters
-num_clients = 10
-num_rounds = 0#300
+num_clients = 100
+num_rounds = 300
 local_epochs = 1
 
-train_bs = 32
-eval_bs = 64
+train_bs = 512
+eval_bs = 512
 
 base_lr = 4e-3
 start_lr = 1e-3
@@ -36,14 +37,14 @@ warmup_rounds = 20
 
 opt_kwargs = {
     "lr": base_lr,
-    "betas": (0.9, 0.999),
+    #"betas": (0.9, 0.999),
     "weight_decay": 0.05,
 }
 
 dl_kwargs = {
-    #"num_workers": 4,
+    "num_workers": 4,
     "pin_memory": (device == "cuda"),
-    # "persistent_workers": True, 
+    "persistent_workers": True, 
 }
 
 ema_decay = 0.995
@@ -69,7 +70,6 @@ rand_erase_p = 0.25
 train_transform = transforms.Compose([
     transforms.Resize(236),
     transforms.CenterCrop(224),
-    #transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
     transforms.RandAugment(num_ops=num_ops, magnitude=magnitude),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -87,6 +87,9 @@ mix_transform = RandomChoice([
     CutMix(num_classes=10,alpha=cutmix_alpha)
 ])
 
+fedprox_mu = 1e-3
+client_frac = 0.5
+
 config = {
     "seed": seed,
     "num_clients": num_clients,
@@ -99,21 +102,27 @@ config = {
     "warmup_rounds": warmup_rounds,
     "opt_kwargs": opt_kwargs,
     "ema_decay": ema_decay,
+    "fedprox_mu": fedprox_mu,
+    "client_frac": client_frac,
     "mixup/cutmix": {"mixup_alpha": mixup_alpha, "cutmix_alpha": cutmix_alpha},
     "RandAugment": {"num_ops": num_ops, "magnitude": magnitude},
     "RandomErasing_p": rand_erase_p,
     "label_smoothing": label_smoothing,
 }
 
-ctx = init_run("imagenette_convnext_fl", config)
+ctx = init_run("imagenet_convnext_fl", config)
 print("Run dir:", ctx["run_dir"])
 
-train = Imagenette(root='data',split='train',download=True, transform=train_transform)
-val = Imagenette(root='data',split='val',download=True, transform=val_transform)
+# train = Imagenette(root='data',split='train',download=True, transform=train_transform)
+# val = Imagenette(root='data',split='val',download=True, transform=val_transform)
+print("Loading data...")
+train = ImageNet(root='data',split='train', transform=train_transform)
+val = ImageNet(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 
 train_eval_loader = DataLoader(train, batch_size=eval_bs, shuffle=False, **dl_kwargs)
 val_loader = DataLoader(val, batch_size=eval_bs, shuffle=False, **dl_kwargs)
+print("Data loaded")
 
 # Client loaders 
 clients = init_clients(
@@ -132,7 +141,7 @@ def set_lr(optimizer, lr):
         
 lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, total_rounds=num_rounds, start_lr=start_lr)
 
-if mix_transform != None:
+if mix_transform is not None:
     train_loss_fn = SoftTargetCrossEntropy()
 else:
     train_loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -154,38 +163,42 @@ for r in range(num_rounds):
     lr_r = float(lr_sched[r])
     client_states = []
     client_ns = []
+    
+    m = max(1, math.ceil(client_frac * num_clients))
+    selected_clients = random.sample(clients,k=num_clients*client_frac)
 
-    for client in clients:
+    for client in selected_clients:
         # Local model starts from current global
         local_model = model_fn().to(device)
         local_model.load_state_dict(global_params)
 
         # Optimizer 
-        optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
-        if client.opt_state is not None:
-            optimizer.load_state_dict(client.opt_state)
+        #optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
+        optimizer = torch.optim.SGD(local_model.parameters(), **client.opt_kwargs)
+        #if client.opt_state is not None:
+        #    optimizer.load_state_dict(client.opt_state)
             
         set_lr(optimizer, lr_r)
 
         # Train 
-        hist = train_client(
+        hist = train_client_fedprox(
             local_model,
             client.loader,
             device,
             optimizer,
             train_loss_fn,
+            mu=fedprox_mu,
             num_epochs=local_epochs,
             log=True,
             mix_transform=mix_transform,
         )
 
         client.metrics[f"round_{r}"] = hist
-        client.opt_state = deepcopy(optimizer.state_dict())
+        #client.opt_state = deepcopy(optimizer.state_dict())
 
         client_states.append(deepcopy(local_model.state_dict()))
         client_ns.append(client.num_samples)
 
-    print("now")
     # Aggregate
     global_params = fedavg(client_states, client_ns)
     global_model.load_state_dict(global_params)
@@ -218,19 +231,17 @@ for r in range(num_rounds):
         if saved:
             print(f"New best at round {r}: {metrics['val_acc']:.4f}")
 
-# tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
-# va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-# print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
-# print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
+va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
+print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
 
 # print(fedavg_comm_cost_mb(global_model, num_clients=num_clients, num_rounds=num_rounds))
 
-x, _ = next(iter(val_loader))
-x = x[:1].contiguous()  # [1, C, H, W]
-x = x.to(device)
-global_model = global_model.to(device).eval()
+# x, _ = next(iter(val_loader))
+# x = x[:1].contiguous()  # [1, C, H, W]
+# x = x.to(device)
+# global_model = global_model.to(device).eval()
 
-macs = count_flops(global_model, x, show_table=True)
-print(macs)
-
-#TODO Data augmentation (paper might use more?)
+# macs = count_flops(global_model, x, show_table=True)
+# print(macs)

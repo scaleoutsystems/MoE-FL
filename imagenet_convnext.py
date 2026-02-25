@@ -13,7 +13,7 @@ from copy import deepcopy
 from utils.fl_utils import fedavg, init_clients, ema_update_model, lr_schedule
 from utils.training_utils import train_client,train_client_fedprox, evaluate
 from utils.metric_utils import  fedavg_comm_cost_mb, count_flops
-from utils.experiment_tracking import init_run, log_and_checkpoint
+from utils.experiment_tracking import init_run, log_and_checkpoint, log_client_metrics
 
 #Reproducability and GPU
 seed=42
@@ -28,8 +28,8 @@ num_clients = 100
 num_rounds = 300
 local_epochs = 1
 
-train_bs = 512
-eval_bs = 512
+train_bs = 128
+eval_bs = 128
 
 base_lr = 4e-3
 start_lr = 1e-3
@@ -42,9 +42,9 @@ opt_kwargs = {
 }
 
 dl_kwargs = {
-    "num_workers": 4,
+    "num_workers": 8,
     "pin_memory": (device == "cuda"),
-    "persistent_workers": True, 
+    "prefetch_factor": 4,
 }
 
 ema_decay = 0.995
@@ -83,11 +83,11 @@ cutmix_alpha = 1.0
 mixup_alpha = 0.8
 
 mix_transform = RandomChoice([ 
-    MixUp(num_classes=10,alpha=mixup_alpha),
-    CutMix(num_classes=10,alpha=cutmix_alpha)
+    MixUp(num_classes=1000,alpha=mixup_alpha),
+    CutMix(num_classes=1000,alpha=cutmix_alpha)
 ])
 
-fedprox_mu = 1e-3
+#fedprox_mu = 1e-4
 client_frac = 0.5
 
 config = {
@@ -102,7 +102,7 @@ config = {
     "warmup_rounds": warmup_rounds,
     "opt_kwargs": opt_kwargs,
     "ema_decay": ema_decay,
-    "fedprox_mu": fedprox_mu,
+    #"fedprox_mu": fedprox_mu,
     "client_frac": client_frac,
     "mixup/cutmix": {"mixup_alpha": mixup_alpha, "cutmix_alpha": cutmix_alpha},
     "RandAugment": {"num_ops": num_ops, "magnitude": magnitude},
@@ -113,8 +113,8 @@ config = {
 ctx = init_run("imagenet_convnext_fl", config)
 print("Run dir:", ctx["run_dir"])
 
-# train = Imagenette(root='data',split='train',download=True, transform=train_transform)
-# val = Imagenette(root='data',split='val',download=True, transform=val_transform)
+#train = Imagenette(root='data',split='train',download=True, transform=train_transform)
+#val = Imagenette(root='data',split='val',download=True, transform=val_transform)
 print("Loading data...")
 train = ImageNet(root='data',split='train', transform=train_transform)
 val = ImageNet(root='data',split='val', transform=val_transform)
@@ -129,7 +129,6 @@ clients = init_clients(
     dataset=train,
     num_clients=num_clients,
     batch_size=train_bs,
-    opt_kwargs=opt_kwargs,
     dl_kwargs=dl_kwargs,
     seed=seed,
     shuffle=True,
@@ -148,9 +147,11 @@ else:
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 def model_fn():
-    return convnext_tiny(weights=None,num_classes=10)
+    return convnext_tiny(weights=None,num_classes=1000)
 
 global_model = model_fn().to(device)
+
+local_model = model_fn().to(device)
 global_params = deepcopy(global_model.state_dict())
 
 ema_model = model_fn().to(device)
@@ -164,60 +165,60 @@ for r in range(num_rounds):
     client_states = []
     client_ns = []
     
-    m = max(1, math.ceil(client_frac * num_clients))
-    selected_clients = random.sample(clients,k=num_clients*client_frac)
+    client_metrics = []
+    
+    m = int(max(1, math.ceil(client_frac * num_clients)))
+    selected_clients = random.sample(clients,k=m)
 
     for client in selected_clients:
         # Local model starts from current global
-        local_model = model_fn().to(device)
         local_model.load_state_dict(global_params)
-
-        # Optimizer 
-        #optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
-        optimizer = torch.optim.SGD(local_model.parameters(), **client.opt_kwargs)
-        #if client.opt_state is not None:
-        #    optimizer.load_state_dict(client.opt_state)
+        optimizer = torch.optim.SGD(local_model.parameters(), **opt_kwargs)
             
         set_lr(optimizer, lr_r)
 
         # Train 
-        hist = train_client_fedprox(
+        hist = train_client(
             local_model,
             client.loader,
             device,
             optimizer,
             train_loss_fn,
-            mu=fedprox_mu,
+            #mu=fedprox_mu,
             num_epochs=local_epochs,
             log=True,
             mix_transform=mix_transform,
         )
 
-        client.metrics[f"round_{r}"] = hist
-        #client.opt_state = deepcopy(optimizer.state_dict())
+        client_metrics.append({
+            "cid": int(client.cid),
+            "num_samples": int(client.num_samples),
+            "history": hist,  
+        })
 
-        client_states.append(deepcopy(local_model.state_dict()))
+        #TODO Make robust and scalable aggregation code
+        #client_states.append(deepcopy(local_model.state_dict()))
+        client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
         client_ns.append(client.num_samples)
 
+    log_client_metrics(ctx,r,client_metrics)
+
     # Aggregate
-    global_params = fedavg(client_states, client_ns)
+    global_params = fedavg(client_states, client_ns,device="cpu")
     global_model.load_state_dict(global_params)
     
     ema_update_model(ema_model, global_model, ema_decay)
         
-    if (r % 10) == 0 or (r == num_rounds - 1):
-        tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
+    if (r % 10) == 0 or (r == num_rounds-1):
         va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
         va_ema = evaluate(ema_model, val_loader, device, loss_fn=eval_loss_fn)
 
-        print(f"[Server Eval] train loss {tr['loss']:.4f} acc {tr['acc']:.4f} | "
+        print(f"[Server Eval] "
             f"val loss {va['loss']:.4f} acc {va['acc']:.4f} | "
             f"EMA val loss {va_ema['loss']:.4f} acc {va_ema['acc']:.4f}")
         
         metrics = {
             "lr": lr_r,
-            "train_loss": float(tr["loss"]),
-            "train_acc": float(tr["acc"]),
             "val_loss": float(va["loss"]),
             "val_acc": float(va["acc"]),
             "val_ema_loss": float(va_ema["loss"]),
@@ -225,8 +226,7 @@ for r in range(num_rounds):
         }
 
         saved = log_and_checkpoint(ctx,r,metrics,global_model,
-                                   ema_model,clients,
-                                   best_key="val_acc", mode="max",)
+                                   ema_model,best_key="val_acc", mode="max",)
 
         if saved:
             print(f"New best at round {r}: {metrics['val_acc']:.4f}")

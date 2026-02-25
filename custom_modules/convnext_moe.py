@@ -149,4 +149,4 @@ def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0):
         mlp_ratio=mlp_ratio,
         capacity_ratio=capacity_ratio,
     )
-    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=10, block=block_factory))
+    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=1000, block=block_factory))

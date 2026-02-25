@@ -29,8 +29,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 # Hyperparameters
-num_clients = 10
-num_rounds = 1#300
+num_clients = 100
+num_rounds = 300
 local_epochs = 1
 
 train_bs = 32
@@ -47,11 +47,11 @@ opt_kwargs = {
 }
 
 dl_kwargs = {
-    # "num_workers": 4,
+    "num_workers": 8,
     "pin_memory": (device == "cuda"),
-    # "persistent_workers": True,  
+    "persistent_workers": True, 
+    "prefetch_factor": 4,
 }
-
 label_smoothing = 0.1
 
 val_transform = transforms.Compose([
@@ -154,6 +154,7 @@ else:
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 global_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
+local_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
 global_params = deepcopy(global_model.state_dict())
 
 # EMA model
@@ -170,7 +171,6 @@ for r in range(num_rounds):
 
     for client in clients:
         # Local model starts from current global
-        local_model = convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio).to(device)
         local_model.load_state_dict(global_params)
 
         # Optimizer 
@@ -206,7 +206,7 @@ for r in range(num_rounds):
     ema_update_model(ema_model, global_model, ema_decay)
 
     # Periodic eval
-    if (r % 10) == 0 or (r == num_rounds - 1):
+    if (r % 25) == 0:
         tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
         va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
         va_ema = evaluate(ema_model, val_loader, device, loss_fn=eval_loss_fn)

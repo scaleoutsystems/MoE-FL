@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import numpy as np
+import math
 import torch.nn.functional as F
 
 #Shazeer 2017 router
@@ -30,7 +30,7 @@ class NoisyTopKRouter(nn.Module):
     @staticmethod
     def _phi(z):
         # Standard normal CDF
-        return 0.5 * (1.0 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
+        return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
     
     @staticmethod
     def _cv_squared(x, eps = 1e-9):

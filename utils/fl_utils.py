@@ -1,18 +1,14 @@
 import torch
 import numpy as np
-from copy import deepcopy
-from torch.utils.data import Subset, DataLoader
-from dataclasses import dataclass, field
+from torch.utils.data import SubsetRandomSampler, DataLoader
+from dataclasses import dataclass
 
 @dataclass
 class Client:
     cid: int
     subset: object                 
     num_samples: int
-    loader: DataLoader
-    opt_kwargs: dict
-    opt_state: dict | None = None  
-    metrics: dict = field(default_factory=dict)
+    loader: DataLoader 
 
 #Allows for batchnorm (not ideal in FL setup)
 @torch.no_grad()
@@ -78,8 +74,11 @@ def lr_schedule(base_lr, warmup_rounds, total_rounds, start_lr):
     lrs = np.where(r < warmup_rounds, warm_lr, cos_lr)
     return lrs
 
-def init_clients(dataset,num_clients,batch_size,
-                opt_kwargs,dl_kwargs,seed=42,shuffle=True):
+def set_lr(optimizer, lr):
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=True):
     n = len(dataset)
     indices = np.arange(n)
 
@@ -91,13 +90,22 @@ def init_clients(dataset,num_clients,batch_size,
 
     clients = []
     for cid, idxs in enumerate(splits):
-        subset = Subset(dataset, idxs.tolist())
+        # idxs is disjoint by construction
+        sampler = SubsetRandomSampler(idxs)  
 
-        loader = DataLoader(subset,batch_size=batch_size,
-                            shuffle=True,**dl_kwargs)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,      
+            shuffle=False,     
+            **dl_kwargs
+        )
 
-        clients.append(Client(cid=cid,subset=subset,
-                              num_samples=len(idxs),loader=loader,
-                              opt_kwargs=deepcopy(opt_kwargs)))
+        clients.append(Client(
+            cid=cid,
+            subset=idxs,          
+            num_samples=len(idxs),
+            loader=loader
+        ))
 
     return clients

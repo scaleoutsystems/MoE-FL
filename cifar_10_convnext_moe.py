@@ -64,6 +64,7 @@ clients = init_clients(
 loss_fn  = nn.CrossEntropyLoss()
 
 global_model = convnext_moe_model_fn(mlp_ratio=mlp_ratio).to(device)
+local_model = convnext_moe_model_fn(mlp_ratio=mlp_ratio).to(device)
 global_params = deepcopy(global_model.state_dict())
 
 for r in range(num_rounds):
@@ -74,7 +75,6 @@ for r in range(num_rounds):
 
     for client in clients:
         # Local model starts from current global
-        local_model = convnext_moe_model_fn(mlp_ratio=mlp_ratio).to(device)
         local_model.load_state_dict(global_params)
 
         # Optimizer 

@@ -11,6 +11,16 @@ def log_metrics(ctx, round_idx, metrics):
 
     with ctx["metrics_path"].open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+        
+def log_client_metrics(ctx, round_idx, client_rows):
+    if not client_rows:
+        return
+
+    t = time.time()
+    lines = [json.dumps({"t": t, "round": int(round_idx), **row}) for row in client_rows]
+
+    with ctx["client_metrics_path"].open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 def init_run(name, config, run_root = "runs", run_id = None):
     
@@ -21,6 +31,7 @@ def init_run(name, config, run_root = "runs", run_id = None):
     run_dir = Path(run_root) / run_id
     ckpt_dir = run_dir / "checkpoints"
     metrics_path = run_dir / "metrics.jsonl"
+    client_metrics_path = run_dir /"client_metrics.jsonl"
 
     # Create directories
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -34,21 +45,25 @@ def init_run(name, config, run_root = "runs", run_id = None):
     if not metrics_path.exists():
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"t": time.time(), "event": "init", "run_id": run_id}) + "\n")
+            
+    if not client_metrics_path.exists():
+        with client_metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": time.time(), "event": "init", "run_id": run_id}) + "\n")
 
     return {
         "run_id": run_id,
         "run_dir": run_dir,
         "ckpt_dir": ckpt_dir,
         "metrics_path": metrics_path,
+        "client_metrics_path": client_metrics_path,
         "best": None,  
     }
 
-def save_checkpoint(ctx, round_idx, global_model, ema_model, clients, metrics=None):
+def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None):
     payload = {
         "round": int(round_idx),
         "global_model": global_model.state_dict(),
         "ema_model": ema_model.state_dict() if ema_model is not None else None,
-        "clients_opt_state": [c.opt_state for c in clients],
         "metrics": metrics or {},
     }
 
@@ -58,7 +73,7 @@ def save_checkpoint(ctx, round_idx, global_model, ema_model, clients, metrics=No
     os.replace(tmp_path, ckpt_path)
     
     
-def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, clients, metrics=None, mode="max"):
+def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics=None, mode="max"):
     if mode not in ("max", "min"):
         raise ValueError("mode must be 'max' or 'min'")
 
@@ -76,7 +91,6 @@ def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, clients
         "best_score": score,
         "global_model": global_model.state_dict(),
         "ema_model": ema_model.state_dict() if ema_model is not None else None,
-        "clients_opt_state": [c.opt_state for c in clients],
         "metrics": metrics or {},
     }
 
@@ -88,10 +102,10 @@ def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, clients
 
 def log_and_checkpoint(ctx,round_idx,metrics,
                        global_model,ema_model,
-                       clients,best_key="val_acc",mode="max",):
+                       best_key="val_acc",mode="max",):
 
-    log_metrics(ctx, round_idx, metrics)
-    save_checkpoint(ctx, round_idx, global_model, ema_model, clients, metrics)
+    log_metrics(ctx, round_idx,  metrics)
+    save_checkpoint(ctx, round_idx, global_model, ema_model, metrics)
 
     score = metrics[best_key]
     saved = save_best_checkpoint(
@@ -100,14 +114,13 @@ def log_and_checkpoint(ctx,round_idx,metrics,
         score=score,
         global_model=global_model,
         ema_model=ema_model,
-        clients=clients,
         metrics=metrics,
         mode=mode,
     )
 
     return saved
     
-def load_checkpoint(ctx, global_model, ema_model, clients, map_location="cpu"):
+def load_checkpoint(ctx, global_model, ema_model, map_location="cpu"):
     ckpt_path = ctx["ckpt_dir"] / "last.pt"
     if not ckpt_path.exists():
         return 0
@@ -117,11 +130,6 @@ def load_checkpoint(ctx, global_model, ema_model, clients, map_location="cpu"):
     global_model.load_state_dict(ckpt["global_model"])
     if ema_model is not None and ckpt.get("ema_model") is not None:
         ema_model.load_state_dict(ckpt["ema_model"])
-
-    opt_states = ckpt.get("clients_opt_state")
-    if opt_states is not None:
-        for c, st in zip(clients, opt_states):
-            c.opt_state = st
 
     # resume at next round
     return int(ckpt["round"]) + 1

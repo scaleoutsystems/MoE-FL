@@ -1,17 +1,20 @@
 import torch
+from torch.amp import autocast, GradScaler
 
 def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=True, mix_transform=None):
+    scaler = GradScaler(device=device)
+    
     model.train()
     history = []
 
     has_aux = hasattr(model, "get_aux_loss")
 
     for epoch in range(num_epochs):
-        running_base = 0.0
-        running_aux = 0.0
-        running_total = 0.0
-        correct = 0
-        total = 0
+        running_base = torch.zeros((), device=device)
+        running_aux = torch.zeros((), device=device)
+        running_total = torch.zeros((), device=device)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        total = torch.zeros((), device=device, dtype=torch.long)
 
         for x, y in loader:
             x = x.to(device, non_blocking=True)
@@ -21,44 +24,44 @@ def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=Tr
                 x, y = mix_transform(x, y)
 
             optimizer.zero_grad(set_to_none=True)
-
-            if has_aux:
-                logits, aux = model(x, return_aux=True)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss + aux
-                aux_val = aux.detach()
-            else:
-                logits = model(x)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss
-                aux_val = None
-
-            total_loss.backward()
-            optimizer.step()
+            
+            #Tesla T4 uses float16
+            with autocast(device_type="cuda", dtype=torch.float16):
+                if has_aux:
+                    logits, aux = model(x, return_aux=True)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss + aux
+                else:
+                    logits = model(x)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss
+                    
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             bs = x.size(0)
-            running_base += base_loss.item() * bs
-            running_total += total_loss.item() * bs
-            if aux_val is not None:
-                running_aux += aux_val.item() * bs
+            running_base  += base_loss.detach() * bs
+            running_total += total_loss.detach() * bs
+            if has_aux:
+                running_aux += aux.detach() * bs
 
             if y.ndim == 2:          # soft labels from MixUp/CutMix
                 y_hard = y.argmax(dim=1)
             else:
                 y_hard = y
-            correct += (logits.argmax(dim=1) == y_hard).sum().item()
+            correct += (logits.argmax(dim=1) == y_hard).sum()
             total += bs
 
-        epoch_base = running_base / total
-        epoch_total = running_total / total
-        epoch_acc = correct / total
-        epoch_aux = (running_aux / total) if has_aux else None
+        epoch_base = (running_base / total).item()
+        epoch_total = (running_total / total).item()
+        epoch_acc = (correct / total).item()
+        epoch_aux = (running_aux / total).item() if has_aux else None
 
         m = {
             "epoch": epoch + 1,
             "total_loss": epoch_total,          
             "acc": epoch_acc,
-            "samples": total,
         }
         
         if has_aux:
@@ -84,6 +87,7 @@ def train_client(model, loader, device, optimizer, loss_fn, num_epochs=1, log=Tr
 
 
 def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epochs=1, log=True, mix_transform=None):
+    scaler = GradScaler(device=device)
     model.train()
     history = []
 
@@ -97,12 +101,12 @@ def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epoc
         }
 
     for epoch in range(num_epochs):
-        running_base = 0.0
-        running_aux = 0.0
-        running_prox = 0.0
-        running_total = 0.0
-        correct = 0
-        total = 0
+        running_base = torch.zeros((), device=device)
+        running_aux = torch.zeros((), device=device)
+        running_prox = torch.zeros((), device=device)
+        running_total = torch.zeros((), device=device)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        total = torch.zeros((), device=device, dtype=torch.long)
 
         for x, y in loader:
             x = x.to(device, non_blocking=True)
@@ -113,19 +117,18 @@ def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epoc
 
             optimizer.zero_grad(set_to_none=True)
 
-            if has_aux:
-                logits, aux = model(x, return_aux=True)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss + aux
-                aux_val = aux.detach()
-            else:
-                logits = model(x)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss
-                aux_val = None
+            with autocast(device_type="cuda", dtype=torch.float16):
+                if has_aux:
+                    logits, aux = model(x, return_aux=True)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss + aux
+                else:
+                    logits = model(x)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss
             
             #FedProx loss added
-            prox = 0.0
+            prox = torch.zeros((), device=device, dtype=torch.float32)
             for name, p in model.named_parameters():
                 if p.requires_grad:
                     # accumulate in fp32 for numerical stability
@@ -135,28 +138,29 @@ def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epoc
             total_loss = total_loss + prox_term
             prox_val = prox_term.detach()
 
-            total_loss.backward()
-            optimizer.step()
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             bs = x.size(0)
-            running_base += base_loss.item() * bs
-            running_prox += prox_val.item() * bs
-            running_total += total_loss.item() * bs
-            if aux_val is not None:
-                running_aux += aux_val.item() * bs
+            running_base += base_loss.detach() * bs
+            running_prox += prox_val.detach() * bs
+            running_total += total_loss.detach() * bs
+            if has_aux:
+                running_aux += aux.detach() * bs
 
             if y.ndim == 2:  #soft labels from MixUp/CutMix
                 y_hard = y.argmax(dim=1)
             else:
                 y_hard = y
-            correct += (logits.argmax(dim=1) == y_hard).sum().item()
+            correct += (logits.argmax(dim=1) == y_hard).sum()
             total += bs
 
-        epoch_base = running_base / total
-        epoch_prox = running_prox / total
-        epoch_total = running_total / total
-        epoch_acc = correct / total
-        epoch_aux = (running_aux / total) if has_aux else None
+        epoch_base = (running_base / total).item()
+        epoch_prox = (running_prox / total).item()
+        epoch_total = (running_total / total).item()
+        epoch_acc = (correct / total).item()
+        epoch_aux = (running_aux / total).item() if has_aux else None
 
         m = {
             "epoch": epoch + 1,
@@ -164,7 +168,6 @@ def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epoc
             "base_loss" : epoch_base,
             "total_loss": epoch_total,          
             "acc": epoch_acc,
-            "samples": total,
         }
         
         if has_aux:
@@ -192,9 +195,9 @@ def train_client_fedprox(model, loader, device, optimizer, loss_fn, mu, num_epoc
 def evaluate(model, loader, device, loss_fn):
     model.eval()
 
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
+    total_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros((), device=device, dtype=torch.long)
+    total_samples = torch.zeros((), device=device, dtype=torch.long)
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -204,12 +207,11 @@ def evaluate(model, loader, device, loss_fn):
         loss = loss_fn(logits, y)
 
         bs = y.size(0)
-        total_loss += loss.item() * bs
-        total_correct += (logits.argmax(dim=1) == y).sum().item()
+        total_loss += loss.detach() * bs
+        total_correct += (logits.argmax(dim=1) == y).sum()
         total_samples += bs
 
     return {
-        "loss": total_loss / total_samples,
-        "acc": total_correct / total_samples,
-        "samples": total_samples,
+        "loss": (total_loss / total_samples).item(),
+        "acc": (total_correct.float() / total_samples).item(),
     }

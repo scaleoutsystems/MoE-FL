@@ -24,14 +24,14 @@ num_clients = 10
 num_rounds = 300
 local_epochs = 1
 
-train_bs = 32
-eval_bs = 64
+train_bs = 128
+eval_bs = 128
 
 base_lr = 4e-3
 
 opt_kwargs = {
     "lr": base_lr,
-    "betas": (0.9, 0.999),
+    #"betas": (0.9, 0.999),
     "weight_decay": 0.05,
 }
 
@@ -55,7 +55,6 @@ clients = init_clients(
     dataset=train,
     num_clients=num_clients,
     batch_size=train_bs,
-    opt_kwargs=opt_kwargs,
     dl_kwargs=dl_kwargs,
     seed=seed,
     shuffle=True,
@@ -68,6 +67,7 @@ def model_fn():
     return ResNet20()
 
 global_model = model_fn().to(device)
+local_model = model_fn().to(device)
 global_params = deepcopy(global_model.state_dict())
 
 # Federated loop
@@ -78,13 +78,10 @@ for r in range(num_rounds):
 
     for client in clients:
         # Local model starts from current global
-        local_model = model_fn().to(device)
         local_model.load_state_dict(global_params)
 
         # Optimizer 
-        optimizer = torch.optim.AdamW(local_model.parameters(), **client.opt_kwargs)
-        if client.opt_state is not None:
-            optimizer.load_state_dict(client.opt_state)
+        optimizer = torch.optim.SGD(local_model.parameters(), **opt_kwargs)
 
         # Train 
         hist = train_client(
@@ -99,16 +96,15 @@ for r in range(num_rounds):
         )
 
         client.metrics[f"round_{r}"] = hist
-        client.opt_state = deepcopy(optimizer.state_dict())
 
         client_states.append(deepcopy(local_model.state_dict()))
         client_ns.append(client.num_samples)
 
     # Aggregate
-    global_params = fedavg(client_states, client_ns)
+    global_params = fedavg(client_states, client_ns,device=device)
     global_model.load_state_dict(global_params)
     
-    if (r % 10) == 0 or (r == num_rounds - 1):
+    if (r % 10) == 0:
         tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
         va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
 

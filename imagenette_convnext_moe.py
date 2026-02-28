@@ -3,8 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageNet
-from torchvision.models import convnext_tiny
+from torchvision.datasets import Imagenette
 from torchvision import transforms
 
 from timm.loss import SoftTargetCrossEntropy
@@ -14,6 +13,7 @@ from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 from utils.fl_utils import init_clients, lr_schedule
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
+from custom_modules.convnext_moe import convnext_moe_model_fn
 
 #Reproducability and GPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -26,14 +26,19 @@ local_epochs = 1
 client_frac = 0.5
 
 batch_size = 128
-base_lr = 4e-3
-start_lr = 1e-3
+base_lr = 0.075
+start_lr = 0.02
 warmup_rounds = 20
 
 label_smoothing = 0.1
 
 fedprox = True
 mu = 1e-3
+
+num_experts = 4
+top_k = 1
+mlp_ratio = 2
+capacity_ratio = 1.0
 
 auto_augment = "rand-m9-mstd0.5-inc1"
 rand_erase_p = 0.25
@@ -54,9 +59,9 @@ opt_kwargs = {
 }
 
 dl_kwargs = {
-    "num_workers": 8,
+    #"num_workers": 8,
     "pin_memory": (device == "cuda"),
-    "prefetch_factor": 4,
+    #"prefetch_factor": 4,
     "drop_last": True,
 }
 
@@ -99,6 +104,14 @@ cfg = {
     "reg": {
         "label_smoothing": label_smoothing,
     },
+    "moe" : {
+        "routing": "noisy_top_k",
+        "expert_placement": "last-2",
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "mlp_ratio": mlp_ratio,
+        "capacity_ratio": capacity_ratio,
+    },
 }
 
 random.seed(seed)
@@ -108,7 +121,7 @@ torch.manual_seed(seed)
 #Transforms 
 val_transform = transforms.Compose([
     transforms.Resize(236,interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(224),
+    transforms.CenterCrop(32),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=IMAGENET_DEFAULT_MEAN,
@@ -117,7 +130,7 @@ val_transform = transforms.Compose([
 ])
 
 train_transform = create_transform(
-    input_size=224,
+    input_size=32,
     is_training=True,
     color_jitter=color_jitter,
     auto_augment=auto_augment,
@@ -136,15 +149,15 @@ mix_transform = Mixup(
     switch_prob=mix_switch_prob,
     mode=mix_mode,
     label_smoothing=label_smoothing,
-    num_classes=1000, 
+    num_classes=10, 
 )
 
-ctx = init_run("imagenet_convnext_fl", cfg)
+ctx = init_run("imagenet_convnext_moe_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-train = ImageNet(root='data',split='train', transform=train_transform)
-val = ImageNet(root='data',split='val', transform=val_transform)
+train = Imagenette(root='data',split='train', transform=train_transform)
+val = Imagenette(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 
 train_eval_loader = DataLoader(train, batch_size=batch_size, shuffle=False, **dl_kwargs)
@@ -174,7 +187,7 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_tiny(weights=None,num_classes=1000)
+    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,num_classes=10)
 
 global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,

@@ -142,11 +142,11 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
     return block
 
 # Model factory 
-def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0):
+def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0,num_classes=1000):
     block_factory = make_last_block_moe_factory(
         num_experts=num_experts,
         top_k=top_k,
         mlp_ratio=mlp_ratio,
         capacity_ratio=capacity_ratio,
     )
-    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=1000, block=block_factory))
+    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=num_classes, block=block_factory))

@@ -12,7 +12,7 @@ class Client:
 
 #Allows for batchnorm (not ideal in FL setup)
 @torch.no_grad()
-def fedavg_batchnorm(client_states, client_num_samples):
+def fedavg_batchnorm(client_states, client_num_samples,device):
     total = sum(client_num_samples)
     weights = [n / total for n in client_num_samples]
 
@@ -31,8 +31,10 @@ def fedavg_batchnorm(client_states, client_num_samples):
     return agg
 
 #Assumes we are not using BatchNorm (which is true for convnext)
+#With this implementation most reasonable to do model aggregation
+#on CPU as that is where we store the local models (while not training)
 @torch.no_grad()
-def fedavg(client_states, client_num_samples, device=None):
+def fedavg(client_states, client_num_samples, device="cpu"):
     total = float(sum(client_num_samples))
 
     weights = [n / total for n in client_num_samples]
@@ -49,6 +51,21 @@ def fedavg(client_states, client_num_samples, device=None):
 
     return agg
 
+@torch.no_grad()
+def snapshot_params_fp32(model):
+    return [p.detach().float().clone() for p in model.parameters() if p.requires_grad]
+
+def compute_prox_term(model, global_params_fp32, mu):
+    # model params (could be fp16/bf16); compute in fp32
+    params = [p for p in model.parameters() if p.requires_grad]
+    params_fp32 = [p if p.dtype == torch.float32 else p.to(torch.float32) for p in params]
+
+    diffs = torch._foreach_sub(params_fp32, global_params_fp32)
+    sq = torch._foreach_mul(diffs, diffs)
+    # sum all tensors
+    prox = sum(t.sum() for t in sq)
+    return 0.5 * mu * prox
+
 #Naive EMA in federated setting
 @torch.no_grad()
 def ema_update_model(ema_model, model, decay):
@@ -61,17 +78,20 @@ def ema_update_model(ema_model, model, decay):
             ema_v.mul_(decay).add_(v, alpha=1.0 - decay)
         else:
             ema_v.copy_(v)
-   
-def lr_schedule(base_lr, warmup_rounds, total_rounds, start_lr):
-    r = np.arange(total_rounds, dtype=np.float32)
 
-    warm_frac = (r + 1) / warmup_rounds
-    warm_lr = base_lr * (start_lr + warm_frac * (1.0 - start_lr))
+def lr_schedule(base_lr, start_lr, warmup_rounds, total_rounds, end_lr=0.0):
+    r = np.arange(total_rounds + 1, dtype=np.float32)
+    lrs = np.zeros_like(r)
 
-    cos_frac = (r - warmup_rounds) / max(1, (total_rounds - warmup_rounds))
-    cos_lr = base_lr * 0.5 * (1.0 + np.cos(np.pi * cos_frac))
+    # Warmup
+    if warmup_rounds > 0:
+        lrs[:warmup_rounds + 1] = np.linspace(start_lr, base_lr, warmup_rounds + 1)
 
-    lrs = np.where(r < warmup_rounds, warm_lr, cos_lr)
+    # Cosine
+    T_max = total_rounds - warmup_rounds
+    t = np.arange(T_max + 1) / T_max
+    lrs[warmup_rounds:] = end_lr + 0.5 * (base_lr - end_lr) * (1 + np.cos(np.pi * t))
+
     return lrs
 
 def set_lr(optimizer, lr):

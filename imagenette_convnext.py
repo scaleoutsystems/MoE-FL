@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageNet
+from torchvision.datasets import Imagenette
 from torchvision.models import convnext_tiny
 from torchvision import transforms
 
@@ -20,7 +20,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 10
+num_clients = 100
 num_rounds = 300
 local_epochs = 1
 client_frac = 0.5
@@ -54,9 +54,9 @@ opt_kwargs = {
 }
 
 dl_kwargs = {
-    "num_workers": 8,
+    #"num_workers": 8,
     "pin_memory": (device == "cuda"),
-    "prefetch_factor": 4,
+    #"prefetch_factor": 4,
     "drop_last": True,
 }
 
@@ -136,20 +136,18 @@ mix_transform = Mixup(
     switch_prob=mix_switch_prob,
     mode=mix_mode,
     label_smoothing=label_smoothing,
-    num_classes=1000, 
+    num_classes=10, 
 )
 
-ctx = init_run("imagenet_convnext_fl", cfg)
+ctx = init_run("imagenette_convnext_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
-print("Loading data...")
-train = ImageNet(root='data',split='train', transform=train_transform)
-val = ImageNet(root='data',split='val', transform=val_transform)
+train = Imagenette(root='data',split='train',download=True, transform=train_transform)
+val = Imagenette(root='data',split='val',download=True, transform=val_transform)
 
 #Global eval loaders 
 train_eval_loader = DataLoader(train, batch_size=batch_size, shuffle=False, **dl_kwargs)
 val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
-print("Data loaded")
 
 # Client loaders 
 clients = init_clients(
@@ -174,7 +172,7 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_tiny(weights=None,num_classes=1000)
+    return convnext_tiny(weights=None,num_classes=10)
 
 global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,

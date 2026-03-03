@@ -44,6 +44,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         norm_layer: Optional[Callable[..., nn.Module]] = None,
     ):
         super().__init__()
+        #This only get enabled when expert activation stats are collected
+        self.collect_expert_stats = False
+        
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
 

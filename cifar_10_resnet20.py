@@ -25,7 +25,7 @@ batch_size = 128
 base_lr = 0.1
 
 fedprox = True
-mu = 4e-2
+mu = 4e-1
 
 pad_size=4
 random_crop_size = 32

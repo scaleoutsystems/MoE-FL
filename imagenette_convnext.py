@@ -20,10 +20,10 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 100
+num_clients = 10
 num_rounds = 300
 local_epochs = 1
-client_frac = 0.5
+client_frac = 1.0
 
 batch_size = 128
 base_lr = 4e-3

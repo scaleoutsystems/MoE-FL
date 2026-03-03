@@ -46,7 +46,7 @@ def fedavg(client_states, client_num_samples, device="cpu"):
     for k, t0 in client_states[0].items():
         acc = torch.zeros_like(t0, device=device, dtype=torch.float32)
         for w, sd in zip(weights, client_states):
-            acc.add_(sd[k].to(device=device, dtype=torch.float32), alpha=w)
+            acc.add_(sd[k], alpha=w) #.to(device=device, dtype=torch.float32)
         agg[k] = acc.to(dtype=t0.dtype)
 
     return agg
@@ -98,9 +98,28 @@ def set_lr(optimizer, lr):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
-def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=True):
+def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=True,subset=1.0):
     n = len(dataset)
     indices = np.arange(n)
+    
+    #Works for ImageNet (may break for other datasets)
+    if subset < 1.0:
+        # Build a balanced subset: equal samples per class
+       # targets = np.array([dataset[i][1] for i in range(n)])
+        targets = np.array(dataset.targets)
+        classes = np.unique(targets)
+        rng = np.random.default_rng(seed)
+
+        total_subset_size = int(n * subset)
+        per_class = total_subset_size // len(classes)
+
+        balanced_indices = []
+        for c in classes:
+            class_idxs = np.where(targets == c)[0]
+            rng.shuffle(class_idxs)
+            balanced_indices.append(class_idxs[:per_class])
+
+        indices = np.concatenate(balanced_indices)
 
     if shuffle:
         rng = np.random.default_rng(seed)

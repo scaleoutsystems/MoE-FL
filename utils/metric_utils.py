@@ -76,3 +76,26 @@ def count_flops(model,inputs,show_table=False,max_depth=4,):
             print(flop_count_table(flops, max_depth=max_depth))
 
     return macs
+
+def print_expert_stats(stats, expert_label_print=False, class_names=None):
+    for layer_name, s in stats.items():
+        print(f"\n{'='*60}")
+        print(f"Layer: {layer_name}")
+        print(f"{'='*60}")
+
+        pct = s["expert_activation_pct"]
+        E = pct.shape[0]
+        print(f"\nOverall expert activation:")
+        for e in range(E):
+            print(f"  Expert {e}: {pct[e]:.1f}%")
+        
+        if expert_label_print:
+            print(f"\nPer-class expert activation:")
+            cls_pct = s["class_expert_activation_pct"]
+            header = "".join(f"{'E'+str(e):>8}" for e in range(E))
+            print(f"  {'Class':<15}{header}")
+            print(f"  {'-'*15}{'-'*8*E}")
+            for c in range(cls_pct.shape[0]):
+                name = class_names[c] if class_names else str(c)
+                row = "".join(f"{cls_pct[c, e]:>7.1f}%" for e in range(E))
+                print(f"  {name:<15}{row}")

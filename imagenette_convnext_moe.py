@@ -26,8 +26,8 @@ local_epochs = 1
 client_frac = 0.5
 
 batch_size = 128
-base_lr = 0.075
-start_lr = 0.02
+base_lr = 4e-3
+start_lr = 1e-3
 warmup_rounds = 20
 
 label_smoothing = 0.1
@@ -121,7 +121,7 @@ torch.manual_seed(seed)
 #Transforms 
 val_transform = transforms.Compose([
     transforms.Resize(236,interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(32),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=IMAGENET_DEFAULT_MEAN,
@@ -130,7 +130,7 @@ val_transform = transforms.Compose([
 ])
 
 train_transform = create_transform(
-    input_size=32,
+    input_size=224,
     is_training=True,
     color_jitter=color_jitter,
     auto_augment=auto_augment,

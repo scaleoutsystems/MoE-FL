@@ -34,7 +34,8 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler,
             optimizer.zero_grad(set_to_none=True)
 
             #Tesla T4 uses f16
-            with autocast(device_type="cuda", dtype=torch.float16):
+            #A100 uses bfloat16
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
                 if has_aux:
                     logits, aux = model(x, return_aux=True)
                     base_loss = loss_fn(logits, y)

@@ -20,14 +20,16 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 10
-num_rounds = 300
+num_clients = 100
+num_rounds = 400
 local_epochs = 1
 client_frac = 0.5
 
-batch_size = 128
-base_lr = 4e-3
-start_lr = 1e-3
+batch_size = 512
+#base_lr = 2e-3
+#start_lr = 1e-3
+base_lr = 0.1   
+start_lr = 0.01
 warmup_rounds = 20
 
 label_smoothing = 0.1
@@ -47,10 +49,19 @@ mix_switch_prob = 0.5
 color_jitter = 0.4
 interpolation = "bicubic"
 
+#Adam
+# opt_kwargs = {
+#     "lr": base_lr,
+#     "betas": (0.9, 0.999),
+#     "weight_decay": 0.05,
+# }
+
+#SGD
 opt_kwargs = {
     "lr": base_lr,
-    "betas": (0.9, 0.999),
-    "weight_decay": 0.05,
+    "momentum": 0.9,
+    "weight_decay": 3e-4,
+    "nesterov": True,
 }
 
 dl_kwargs = {
@@ -104,6 +115,7 @@ cfg = {
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 #Transforms 
 val_transform = transforms.Compose([
@@ -158,7 +170,7 @@ clients = init_clients(
     batch_size=batch_size,
     dl_kwargs=dl_kwargs,
     seed=seed,
-    shuffle=True,
+    shuffle=True
 )
         
 lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
@@ -171,7 +183,7 @@ else:
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 def opt_fn(model, opt_kwargs):
-    return torch.optim.AdamW(model.parameters(), **opt_kwargs)
+    return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
     return convnext_tiny(weights=None,num_classes=1000)

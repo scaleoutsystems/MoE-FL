@@ -104,8 +104,6 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=T
     
     #Works for ImageNet (may break for other datasets)
     if subset < 1.0:
-        # Build a balanced subset: equal samples per class
-       # targets = np.array([dataset[i][1] for i in range(n)])
         targets = np.array(dataset.targets)
         classes = np.unique(targets)
         rng = np.random.default_rng(seed)

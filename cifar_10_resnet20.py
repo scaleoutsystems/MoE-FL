@@ -17,15 +17,15 @@ print("Running on:", device)
 
 seed=42
 num_clients = 10
-num_rounds = 200
+num_rounds = 300
 local_epochs = 1
 client_frac = 0.5
 
 batch_size = 128
-base_lr = 0.1
+base_lr = 0.05
 
 fedprox = True
-mu = 4e-1
+mu = 8e-1
 
 pad_size=4
 random_crop_size = 32

@@ -129,9 +129,8 @@ def fl_loop(clients,model_fn,opt_fn,
     fedprox = fl_kwargs['fedprox']
     mu = fl_kwargs['mu']
     
-    global_model = model_fn().to(device)
-
-    local_model = model_fn().to(device)
+    global_model = torch.compile(model_fn().to(device))
+    local_model = torch.compile(model_fn().to(device))
     global_params = deepcopy(global_model.state_dict())
     
     if amp_dtype == torch.float16:
@@ -150,32 +149,10 @@ def fl_loop(clients,model_fn,opt_fn,
         
         #Global model snapshot for fedprox
         if fedprox:
-            snap = snapshot_params_fp32(global_model)
+            snap = snapshot_params_fp32(global_model,device)
         else:
             snap = None
 
-        # for client in selected_clients:
-        #     # Local model starts from current global
-        #     local_model.load_state_dict(global_params)
-        #     optimizer = opt_fn(local_model, opt_kwargs)
-                
-        #     set_lr(optimizer, lr_r)
-
-        #     # Train 
-        #     hist = train_client(local_model,client.loader,
-        #                         device,optimizer,train_loss_fn,scaler,amp_dtype,
-        #                         num_epochs=local_epochs,log=True,
-        #                         mix_transform=mix_transform,
-        #                         fedprox=fedprox,mu=mu, snap=snap)
-
-        #     client_metrics.append({
-        #         "cid": int(client.cid),
-        #         "num_samples": int(client.num_samples),
-        #         "history": hist,  
-        #     })
-        #     #Store client states not actively being trained on CPU to avoid filling VRAM
-        #     client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
-        #     client_ns.append(client.num_samples)
         selected_clients[0].prefetch()
 
         for i, client in enumerate(selected_clients):
@@ -205,6 +182,7 @@ def fl_loop(clients,model_fn,opt_fn,
             client_ns.append(client.num_samples)
 
             client.free()  # release RAM 
+            del loader #Delete the loader to not go over number of CPU cores available
 
         log_client_metrics(ctx,r,client_metrics)
 

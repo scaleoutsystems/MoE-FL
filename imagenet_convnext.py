@@ -21,19 +21,19 @@ print("Running on:", device)
 
 seed=42
 num_clients = 100
-num_rounds = 100
+num_rounds = 50
 local_epochs = 10
-client_frac = 0.3
+client_frac = 0.2
 
 batch_size = 512
 base_lr = 0.1   
 start_lr = 0.01
-warmup_rounds = 20
+warmup_rounds = 5
 
 label_smoothing = 0.1
 
 fedprox = True
-mu = 1e-3
+mu = 2e-3
 
 auto_augment = "rand-m9-mstd0.5-inc1"
 rand_erase_p = 0.25
@@ -153,24 +153,12 @@ ctx = init_run("imagenet_convnext_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-#train = ImageNet(root='data',split='train', transform=train_transform)
 train = ImageNet(root='data', split='train', transform=None)
 val = ImageNet(root='data',split='val', transform=val_transform)
 
-#Global eval loaders 
-#train_eval_loader = DataLoader(train, batch_size=batch_size, shuffle=False, **dl_kwargs)
+#Global eval loader
 val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
 print("Data loaded")
-
-# Client loaders 
-# clients = init_clients(
-#     dataset=train,
-#     num_clients=num_clients,
-#     batch_size=batch_size,
-#     dl_kwargs=dl_kwargs,
-#     seed=seed,
-#     shuffle=True
-# )
 
 clients = init_clients(
     dataset=train,
@@ -210,7 +198,5 @@ global_model = fl_loop(clients=clients,
                        fl_kwargs=cfg['fed'],
                        opt_kwargs=opt_kwargs)
 
-#tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
 va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-#print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
 print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

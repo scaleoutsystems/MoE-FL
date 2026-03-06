@@ -5,6 +5,13 @@ from copy import deepcopy
 from torch.amp import autocast, GradScaler
 from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
 from .experiment_tracking import log_and_checkpoint, log_client_metrics
+import gc
+import ctypes
+
+#We have to force free the RAM
+def release_memory():
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
 
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
@@ -181,8 +188,10 @@ def fl_loop(clients,model_fn,opt_fn,
             client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
             client_ns.append(client.num_samples)
 
-            client.free()  # release RAM 
             del loader #Delete the loader to not go over number of CPU cores available
+            gc.collect()
+            client.free()  # release RAM
+            release_memory() 
 
         log_client_metrics(ctx,r,client_metrics)
 

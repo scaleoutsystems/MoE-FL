@@ -1,6 +1,7 @@
 import torch
+import threading
 import numpy as np
-from torch.utils.data import SubsetRandomSampler, DataLoader
+from torch.utils.data import SubsetRandomSampler, DataLoader, Dataset
 from dataclasses import dataclass
 
 @dataclass
@@ -97,26 +98,114 @@ def lr_schedule(base_lr, start_lr, warmup_rounds, total_rounds, end_lr=0.0):
 def set_lr(optimizer, lr):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
+        
+        
+class RawImageSubset(Dataset):
+    """Reads raw PIL images from disk, bypassing the dataset's transform."""
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
 
-def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=True,subset=1.0):
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        path, label = self.dataset.imgs[self.indices[idx]]
+        img = self.dataset.loader(path)
+        return img, label
+
+
+class InMemoryDataset(Dataset):
+    """Holds raw PIL images in RAM, applies transform fresh on every access."""
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img, label = self.samples[idx]
+        return self.transform(img), label
+
+
+class Client:
+    def __init__(self, cid, subset, num_samples, dataset, transform, dl_kwargs, batch_size):
+        self.cid = cid
+        self.subset = subset
+        self.num_samples = num_samples
+        self._dataset = dataset
+        self._transform = transform
+        self._dl_kwargs = dl_kwargs
+        self._batch_size = batch_size
+        self._samples = None
+        self._thread = None
+        self._error = None
+
+    def prefetch(self):
+        self._samples = None
+        self._error = None
+
+        def _load():
+            try:
+                raw_subset = RawImageSubset(self._dataset, self.subset)
+                tmp_loader = DataLoader(
+                    raw_subset,
+                    batch_size=256,
+                    num_workers=10,
+                    pin_memory=False,
+                    prefetch_factor=4,
+                    persistent_workers=False,
+                    shuffle=False,
+                    collate_fn=lambda x: x,
+                )
+                samples = []
+                for batch in tmp_loader:
+                    samples.extend(batch)
+                self._samples = samples
+            except Exception as e:
+                self._error = e
+
+        self._thread = threading.Thread(target=_load, daemon=True)
+        self._thread.start()
+
+    def get_loader(self):
+        self._thread.join()
+        if self._error:
+            raise RuntimeError(f"Client {self.cid} prefetch failed: {self._error}")
+        ram_dl_kwargs = {
+            **self._dl_kwargs,
+            "num_workers": 4,
+            "prefetch_factor": 2,
+            "persistent_workers": False,
+        }
+        return DataLoader(
+            InMemoryDataset(self._samples, self._transform),
+            batch_size=self._batch_size,
+            shuffle=True,
+            **ram_dl_kwargs
+        )
+
+    def free(self):
+        self._samples = None
+
+
+def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
+                 seed=42, shuffle=True, subset=1.0):
     n = len(dataset)
     indices = np.arange(n)
-    
-    #Works for ImageNet (may break for other datasets)
+
     if subset < 1.0:
         targets = np.array(dataset.targets)
         classes = np.unique(targets)
         rng = np.random.default_rng(seed)
-
         total_subset_size = int(n * subset)
         per_class = total_subset_size // len(classes)
-
         balanced_indices = []
         for c in classes:
             class_idxs = np.where(targets == c)[0]
             rng.shuffle(class_idxs)
             balanced_indices.append(class_idxs[:per_class])
-
         indices = np.concatenate(balanced_indices)
 
     if shuffle:
@@ -127,22 +216,63 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=T
 
     clients = []
     for cid, idxs in enumerate(splits):
-        # idxs is disjoint by construction
-        sampler = SubsetRandomSampler(idxs)  
-
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,      
-            shuffle=False,     
-            **dl_kwargs
-        )
-
         clients.append(Client(
             cid=cid,
-            subset=idxs,          
+            subset=idxs,
             num_samples=len(idxs),
-            loader=loader
+            dataset=dataset,
+            transform=transform,
+            dl_kwargs=dl_kwargs,
+            batch_size=batch_size,
         ))
 
     return clients
+
+# def init_clients(dataset, num_clients, batch_size, dl_kwargs, seed=42, shuffle=True,subset=1.0):
+#     n = len(dataset)
+#     indices = np.arange(n)
+    
+#     #Works for ImageNet (may break for other datasets)
+#     if subset < 1.0:
+#         targets = np.array(dataset.targets)
+#         classes = np.unique(targets)
+#         rng = np.random.default_rng(seed)
+
+#         total_subset_size = int(n * subset)
+#         per_class = total_subset_size // len(classes)
+
+#         balanced_indices = []
+#         for c in classes:
+#             class_idxs = np.where(targets == c)[0]
+#             rng.shuffle(class_idxs)
+#             balanced_indices.append(class_idxs[:per_class])
+
+#         indices = np.concatenate(balanced_indices)
+
+#     if shuffle:
+#         rng = np.random.default_rng(seed)
+#         rng.shuffle(indices)
+
+#     splits = np.array_split(indices, num_clients)
+
+#     clients = []
+#     for cid, idxs in enumerate(splits):
+#         # idxs is disjoint by construction
+#         sampler = SubsetRandomSampler(idxs)  
+
+#         loader = DataLoader(
+#             dataset,
+#             batch_size=batch_size,
+#             sampler=sampler,      
+#             shuffle=False,     
+#             **dl_kwargs
+#         )
+
+#         clients.append(Client(
+#             cid=cid,
+#             subset=idxs,          
+#             num_samples=len(idxs),
+#             loader=loader
+#         ))
+
+#     return clients

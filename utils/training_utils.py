@@ -7,7 +7,7 @@ from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
 from .experiment_tracking import log_and_checkpoint, log_client_metrics
 
 
-def train_client(model,loader,device,optimizer,loss_fn, scaler,
+def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
                 fedprox = False,mu=0.0, snap = None):
     #snap is a frozen global model only needed when fedprox enabled
@@ -35,7 +35,7 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler,
 
             #Tesla T4 uses f16
             #A100 uses bfloat16
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast(device_type="cuda", dtype=amp_dtype):
                 if has_aux:
                     logits, aux = model(x, return_aux=True)
                     base_loss = loss_fn(logits, y)
@@ -50,19 +50,13 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler,
                 prox_term = compute_prox_term(model,snap,mu)
                 total_loss = total_loss + prox_term
             
-            #CODE to check for AMP step skips 
-            # prev_scale = scaler.get_scale()
-            # scaler.scale(total_loss).backward()
-            # scaler.unscale_(optimizer)
-            # scaler.step(optimizer)
-            # scaler.update()
-            # new_scale = scaler.get_scale()
-            # skipped = new_scale < prev_scale  #overflow detected
-            # if skipped:
-            #     print(f"[AMP] step skipped (scale {prev_scale} -> {new_scale})")
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is None:
+                total_loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
             bs = x.size(0)
             running_base  += base_loss.detach() * bs
@@ -125,7 +119,8 @@ def fl_loop(clients,model_fn,opt_fn,
             lr_sched,mix_transform,
             val_loader,device,
             ctx,fl_kwargs,opt_kwargs,
-            eval_every=10, agg_fn=fedavg):
+            eval_every=10, agg_fn=fedavg,
+            amp_dtype=torch.bfloat16):
     
     client_frac = fl_kwargs['client_frac']
     num_clients = fl_kwargs['num_clients']
@@ -139,7 +134,10 @@ def fl_loop(clients,model_fn,opt_fn,
     local_model = model_fn().to(device)
     global_params = deepcopy(global_model.state_dict())
     
-    scaler = GradScaler(device=device)
+    if amp_dtype == torch.float16:
+        scaler = GradScaler(device=device)
+    else:
+        scaler = None
 
     # Federated loop
     for r in range(num_rounds):
@@ -156,28 +154,57 @@ def fl_loop(clients,model_fn,opt_fn,
         else:
             snap = None
 
-        for client in selected_clients:
-            # Local model starts from current global
+        # for client in selected_clients:
+        #     # Local model starts from current global
+        #     local_model.load_state_dict(global_params)
+        #     optimizer = opt_fn(local_model, opt_kwargs)
+                
+        #     set_lr(optimizer, lr_r)
+
+        #     # Train 
+        #     hist = train_client(local_model,client.loader,
+        #                         device,optimizer,train_loss_fn,scaler,amp_dtype,
+        #                         num_epochs=local_epochs,log=True,
+        #                         mix_transform=mix_transform,
+        #                         fedprox=fedprox,mu=mu, snap=snap)
+
+        #     client_metrics.append({
+        #         "cid": int(client.cid),
+        #         "num_samples": int(client.num_samples),
+        #         "history": hist,  
+        #     })
+        #     #Store client states not actively being trained on CPU to avoid filling VRAM
+        #     client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
+        #     client_ns.append(client.num_samples)
+        selected_clients[0].prefetch()
+
+        for i, client in enumerate(selected_clients):
+            if i + 1 < len(selected_clients):
+                selected_clients[i + 1].prefetch()
+
+            loader = client.get_loader()
+
             local_model.load_state_dict(global_params)
             optimizer = opt_fn(local_model, opt_kwargs)
-                
             set_lr(optimizer, lr_r)
 
-            # Train 
-            hist = train_client(local_model,client.loader,
-                                device,optimizer,train_loss_fn,scaler,
-                                num_epochs=local_epochs,log=True,
-                                mix_transform=mix_transform,
-                                fedprox=fedprox,mu=mu, snap=snap)
+            hist = train_client(
+                local_model, loader, device, optimizer,
+                train_loss_fn, scaler, amp_dtype,
+                num_epochs=local_epochs, log=True,
+                mix_transform=mix_transform,
+                fedprox=fedprox, mu=mu, snap=snap
+            )
 
             client_metrics.append({
                 "cid": int(client.cid),
                 "num_samples": int(client.num_samples),
-                "history": hist,  
+                "history": hist,
             })
-            #Store client states not actively being trained on CPU to avoid filling VRAM
             client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
             client_ns.append(client.num_samples)
+
+            client.free()  # release RAM 
 
         log_client_metrics(ctx,r,client_metrics)
 

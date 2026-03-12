@@ -2,6 +2,12 @@ import torch
 import threading
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
+import ctypes
+
+#We have to force free the RAM
+def release_memory():
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
 
 #Allows for batchnorm (not ideal in FL setup)
 @torch.no_grad()
@@ -29,9 +35,7 @@ def fedavg_batchnorm(client_states, client_num_samples,device):
 @torch.no_grad()
 def fedavg(client_states, client_num_samples, device="cpu"):
     total = float(sum(client_num_samples))
-
     weights = [n / total for n in client_num_samples]
-
     #Ensure work is done on correct device
     device = torch.device(device)
 
@@ -118,7 +122,7 @@ class InMemoryDataset(Dataset):
 
     def __getitem__(self, idx):
         img, label = self.samples[idx]
-        return self.transform(img), label
+        return self.transform(img), int(label)
 
 
 class Client:
@@ -165,6 +169,7 @@ class Client:
         self._thread.join()
         if self._error:
             raise RuntimeError(f"Client {self.cid} prefetch failed: {self._error}")
+        release_memory()
         ram_dl_kwargs = {
             **self._dl_kwargs,
             "num_workers": 9,
@@ -177,6 +182,9 @@ class Client:
             shuffle=True,
             **ram_dl_kwargs
         )
+        #uncomment for local testing instead of code above
+        # subset = Subset(self._dataset, self.subset)
+        # return DataLoader(subset, batch_size=self._batch_size, shuffle=True, **self._dl_kwargs)
 
     def free(self):
         self._samples = None

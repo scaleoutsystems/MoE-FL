@@ -21,19 +21,19 @@ print("Running on:", device)
 
 seed=42
 num_clients = 100
-num_rounds = 300
-local_epochs = 1
-client_frac = 0.5
+num_rounds = 50
+local_epochs = 10
+client_frac = 0.2
 
-batch_size = 128
+batch_size = 256
 base_lr = 4e-3
 start_lr = 1e-3
-warmup_rounds = 20
+warmup_rounds = 5
 
 label_smoothing = 0.1
 
-fedprox = True
-mu = 1e-3
+fedprox = False
+mu = 0
 
 num_experts = 4
 top_k = 1
@@ -52,10 +52,16 @@ mix_switch_prob = 0.5
 color_jitter = 0.4
 interpolation = "bicubic"
 
+# opt_kwargs = {
+#     "lr": base_lr,
+#     "betas": (0.9, 0.999),
+#     "weight_decay": 0.05,
+# }
 opt_kwargs = {
     "lr": base_lr,
-    "betas": (0.9, 0.999),
-    "weight_decay": 0.05,
+    "momentum": 0.9,
+    "weight_decay": 3e-4,
+    "nesterov": True,
 }
 
 dl_kwargs = {
@@ -156,7 +162,7 @@ ctx = init_run("imagenet_convnext_moe_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-train = ImageNet(root='data',split='train', transform=train_transform)
+train = ImageNet(root='data',split='train', transform=None)
 val = ImageNet(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 
@@ -172,6 +178,7 @@ clients = init_clients(
     dl_kwargs=dl_kwargs,
     seed=seed,
     shuffle=True,
+    transform=train_transform
 )
         
 lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
@@ -184,7 +191,7 @@ else:
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 def opt_fn(model, opt_kwargs):
-    return torch.optim.AdamW(model.parameters(), **opt_kwargs)
+    return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
     return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio)

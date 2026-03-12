@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageNet
+#from torchvision.datasets import ImageNet
 from torchvision.models import convnext_tiny
 from torchvision import transforms
 
@@ -14,34 +14,36 @@ from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 from utils.fl_utils import init_clients, lr_schedule
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
+from utils.data_utils import ImageNetSubset
 
 #Reproducability and GPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 100
+num_clients = 20
 num_rounds = 50
 local_epochs = 10
 client_frac = 0.2
 
-batch_size = 512
-base_lr = 0.1   
-start_lr = 0.01
+batch_size = 64
+base_lr = 0.025
+start_lr = 0.005
 warmup_rounds = 5
 
 label_smoothing = 0.1
 
-fedprox = True
-mu = 2e-3
+fedprox = False
+mu = 0
 
-auto_augment = "rand-m9-mstd0.5-inc1"
-rand_erase_p = 0.25
+#Comments are full imagenet augments we reduce for the subset
+auto_augment ="rand-m6-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+rand_erase_p = 0.15 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
 cutmix_alpha = 1.0
-mixup_alpha = 0.8
-mix_prob = 1.0
+mixup_alpha = 0.4 #0.8
+mix_prob = 0.8
 mix_mode = "batch"
 mix_switch_prob = 0.5
 color_jitter = 0.4
@@ -153,8 +155,8 @@ ctx = init_run("imagenet_convnext_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-train = ImageNet(root='data', split='train', transform=None)
-val = ImageNet(root='data',split='val', transform=val_transform)
+train = ImageNetSubset(root='data', split='train', transform=None)
+val = ImageNetSubset(root='data',split='val', transform=val_transform)
 
 #Global eval loader
 val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
@@ -183,7 +185,7 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_tiny(weights=None,num_classes=1000)
+    return convnext_tiny(weights=None,num_classes=100)
 
 global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,

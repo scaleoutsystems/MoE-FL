@@ -66,11 +66,8 @@ class NoisyTopKRouter(nn.Module):
         return self.load_coeff * self._cv_squared(load, self.eps)
     
     def forward(self, x, return_aux=True):
-        orig_shape = x.shape
-        x2 = x.reshape(-1, orig_shape[-1])
-
-        logits = self.gate(x2)  # clean logits
-        noise_std = F.softplus(self.noise(x2)) + self.eps
+        logits = self.gate(x)  # clean logits
+        noise_std = F.softplus(self.noise(x)) + self.eps
 
         # Only add noise during training
         if self.training:
@@ -98,11 +95,6 @@ class NoisyTopKRouter(nn.Module):
             if self.load_coeff != 0.0:
                 aux = aux + self._load_loss(logits, noise_std, noisy_logits)  # uses noisy threshold
             aux_loss = aux
-
-        leading = orig_shape[:-1]
-        topi = topi.view(*leading, self.top_k)
-        weights = weights.view(*leading, self.top_k)
-        priority = priority.view(*leading)
 
         return topi, weights, priority, aux_loss
     

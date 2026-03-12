@@ -2,7 +2,6 @@ import torch
 
 #Mixin class for shared patch routing functionality
 class PatchDispatcher:     
-    #TODO: If found to be bottleneck, rewrite for speed
     def moe_route(self, x_flat, topi, weights, order):
         T, C = x_flat.shape
         K = topi.shape[1]
@@ -39,9 +38,6 @@ class PatchDispatcher:
 
         # Keep only first Be routes per expert (highest priority due to BPR ordering)
         keep = pos_in_chunk < Be
-        
-        if self.collect_expert_stats:
-            self._last_routing = (expert_id[keep].cpu(), token_idx[keep].cpu(), T)
 
         token_idx = token_idx[keep]
         expert_id = expert_id[keep]
@@ -52,18 +48,37 @@ class PatchDispatcher:
         # Recompute chunk boundaries after dropping overflow routes
         counts = torch.bincount(expert_id, minlength=E)
         offsets = torch.cumsum(counts, dim=0)
+        starts  = offsets - counts
+        
+        if self.collect_expert_stats:
+            self._last_routing = (expert_id.cpu(), token_idx.cpu(), T)
+        
+        #Build padded input tensor
+        # slot[e, pos] = which position within expert e's chunk this route occupies
+        pos_in_chunk = torch.arange(token_idx.numel(), device=device) - starts[expert_id]
 
-        start = 0
-        for e, expert in enumerate(self.experts):
-            end = int(offsets[e])
-            if end == start:
-                continue
+        #Gather tokens into padded buffer zero padding fills unused slots
+        x_in = x_flat.new_zeros(E, Be, C)                       
+        x_in[expert_id, pos_in_chunk] = x_flat[token_idx]      
 
-            idx_e = token_idx[start:end]        # tokens kept for this expert
-            x_e = x_flat.index_select(0, idx_e) # gather tokens
-            y_e = expert(x_e) * gate_w[start:end]
-            out.index_add_(0, idx_e, y_e)
-            start = end
+        # Also store gate weights in the same layout for later
+        g_in = gate_w.new_zeros(E, Be, 1)                      
+        g_in[expert_id, pos_in_chunk] = gate_w
+
+        #Batched expert forward 
+        w1 = torch.stack([exp.block[0].weight.t() for exp in self.experts])  
+        b1 = torch.stack([exp.block[0].bias       for exp in self.experts])  
+        w2 = torch.stack([exp.block[2].weight.t() for exp in self.experts])  
+        b2 = torch.stack([exp.block[2].bias       for exp in self.experts]) 
+        h = torch.bmm(x_in, w1) + b1.unsqueeze(1)   
+        h = torch.nn.functional.gelu(h)
+        y = torch.bmm(h, w2) + b2.unsqueeze(1)       
+        # Apply gate weights
+        y = y * g_in                                  
+
+        #Scatter back
+        out = x_flat.new_zeros(T, C)
+        out.index_add_(0, token_idx, y[expert_id, pos_in_chunk])
 
         return out   
 class MoEStatsCollector:

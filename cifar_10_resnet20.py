@@ -7,7 +7,7 @@ import random
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from utils.fl_utils import init_clients, fedavg_batchnorm, lr_schedule
-from utils.training_utils import evaluate, fl_loop
+from utils.training_utils import evaluate, fl_loop_local
 from utils.experiment_tracking import init_run
 from custom_modules.resnet20 import ResNet20
     
@@ -16,16 +16,16 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 10
+num_clients = 100
 num_rounds = 300
-local_epochs = 1
-client_frac = 0.5
+local_epochs = 10
+client_frac = 0.2
 
-batch_size = 128
+batch_size = 25
 base_lr = 0.05
 
-fedprox = True
-mu = 8e-1
+fedprox = False
+mu = 0
 
 pad_size=4
 random_crop_size = 32
@@ -111,6 +111,7 @@ clients = init_clients(
     dl_kwargs=dl_kwargs,
     seed=seed,
     shuffle=True,
+    transform=train_transform,
 )
 
 train_loss_fn = nn.CrossEntropyLoss()
@@ -122,13 +123,14 @@ def model_fn():
 def opt_fn(model, opt_kwargs):
     return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
-global_model = fl_loop(clients=clients,
+global_model = fl_loop_local(clients=clients,
                        model_fn=model_fn,
                        opt_fn=opt_fn,
                        train_loss_fn=train_loss_fn,
                        eval_loss_fn=eval_loss_fn,
                        lr_sched=lr_sched,
                        val_loader=val_loader,
+                       train_eval_loader=train_eval_loader,
                        device=device,
                        ctx=ctx,
                        fl_kwargs=cfg['fed'],

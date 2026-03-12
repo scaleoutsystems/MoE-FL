@@ -6,8 +6,9 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
 
+from torchvision.models import convnext_tiny
 from utils.fl_utils import init_clients, lr_schedule
-from utils.training_utils import evaluate, fl_loop
+from utils.training_utils import evaluate, fl_loop_local
 from utils.experiment_tracking import init_run
 from custom_modules.convnext_moe import convnext_moe_model_fn
 
@@ -16,20 +17,20 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 10
+num_clients = 20
 num_rounds = 200
-local_epochs = 1
-client_frac = 0.5
+local_epochs = 10
+client_frac = 0.2
 
 batch_size = 128
-base_lr = 4e-3
-start_lr = 1e-3
-warmup_rounds = 20
+base_lr = 2e-4
+start_lr = 0.5e-4
+warmup_rounds = 10
 
 label_smoothing = 0.1
 
-fedprox = True
-mu = 1e-3
+fedprox = False
+mu = 0
 
 num_experts = 4
 top_k = 1
@@ -40,11 +41,19 @@ pad_size=4
 random_crop_size = 32
 random_flip_prob = 0.5
 
+#Adam
 opt_kwargs = {
     "lr": base_lr,
     "betas": (0.9, 0.999),
     "weight_decay": 0.05,
 }
+
+# opt_kwargs = {
+#     "lr": base_lr,
+#     "momentum": 0.9,
+#     "weight_decay": 3e-4,
+#     "nesterov": True,
+# }
 
 dl_kwargs = {
     #"num_workers": 8,
@@ -133,6 +142,7 @@ clients = init_clients(
     dl_kwargs=dl_kwargs,
     seed=seed,
     shuffle=True,
+    transform=train_transform
 )
     
 train_loss_fn = nn.CrossEntropyLoss()
@@ -140,11 +150,12 @@ eval_loss_fn  = nn.CrossEntropyLoss()
 
 def opt_fn(model, opt_kwargs):
     return torch.optim.AdamW(model.parameters(), **opt_kwargs)
+    #return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,num_classes=10)
+    return convnext_tiny(weights=None,num_classes=10)#convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,num_classes=10)
 
-global_model = fl_loop(clients=clients, 
+global_model = fl_loop_local(clients=clients, 
                        model_fn=model_fn,
                        opt_fn = opt_fn,
                        train_loss_fn=train_loss_fn,
@@ -152,6 +163,7 @@ global_model = fl_loop(clients=clients,
                        lr_sched=lr_sched,
                        mix_transform=None,
                        val_loader=val_loader,
+                       train_eval_loader=train_eval_loader,
                        device=device,
                        ctx=ctx,
                        fl_kwargs=cfg['fed'],

@@ -6,13 +6,6 @@ from torch.amp import autocast, GradScaler
 from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
 from .experiment_tracking import log_and_checkpoint, log_client_metrics
 import gc
-import ctypes
-
-#We have to force free the RAM
-def release_memory():
-    libc = ctypes.CDLL("libc.so.6")
-    libc.malloc_trim(0)
-
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
@@ -126,7 +119,7 @@ def fl_loop(clients,model_fn,opt_fn,
             lr_sched,mix_transform,
             val_loader,device,
             ctx,fl_kwargs,opt_kwargs,
-            eval_every=10, agg_fn=fedavg,
+            eval_every=1, agg_fn=fedavg,
             amp_dtype=torch.bfloat16):
     
     client_frac = fl_kwargs['client_frac']
@@ -163,10 +156,10 @@ def fl_loop(clients,model_fn,opt_fn,
         selected_clients[0].prefetch()
 
         for i, client in enumerate(selected_clients):
+            print(f"Client {client.cid}")
+            loader = client.get_loader()
             if i + 1 < len(selected_clients):
                 selected_clients[i + 1].prefetch()
-
-            loader = client.get_loader()
 
             local_model.load_state_dict(global_params)
             optimizer = opt_fn(local_model, opt_kwargs)
@@ -191,7 +184,6 @@ def fl_loop(clients,model_fn,opt_fn,
             del loader #Delete the loader to not go over number of CPU cores available
             gc.collect()
             client.free()  # release RAM
-            release_memory() 
 
         log_client_metrics(ctx,r,client_metrics)
 
@@ -243,3 +235,77 @@ def evaluate(model, loader, device, loss_fn):
         "loss": (total_loss / total_samples).item(),
         "acc": (total_correct.float() / total_samples).item(),
     }
+    
+#For local testing
+def fl_loop_local(clients,model_fn,opt_fn,
+            train_loss_fn,eval_loss_fn,
+            lr_sched,mix_transform,
+            val_loader,train_eval_loader,device,
+            ctx,fl_kwargs,opt_kwargs,
+            eval_every=1, agg_fn=fedavg,
+            amp_dtype=torch.float16):
+    
+    client_frac = fl_kwargs['client_frac']
+    num_clients = fl_kwargs['num_clients']
+    num_rounds = fl_kwargs['num_rounds']
+    local_epochs = fl_kwargs['local_epochs']
+    fedprox = fl_kwargs['fedprox']
+    mu = fl_kwargs['mu']
+    
+    global_model = model_fn().to(device)
+    local_model = model_fn().to(device)
+    global_params = deepcopy(global_model.state_dict())
+    
+    if amp_dtype == torch.float16:
+        scaler = GradScaler(device=device)
+    else:
+        scaler = None
+
+    # Federated loop
+    for r in range(num_rounds):
+        print(f"\n=== Round {r} ===")
+        lr_r = float(lr_sched[r])
+        client_states, client_ns, client_metrics = [], [], []
+        
+        m = int(max(1, math.ceil(client_frac * num_clients)))
+        selected_clients = random.sample(clients,k=m)
+        
+        #Global model snapshot for fedprox
+        if fedprox:
+            snap = snapshot_params_fp32(global_model,device)
+        else:
+            snap = None
+
+        for client in selected_clients:
+
+            local_model.load_state_dict(global_params)
+            optimizer = opt_fn(local_model, opt_kwargs)
+            set_lr(optimizer, lr_r)
+
+            hist = train_client(
+                local_model, client.get_loader(), device, optimizer,
+                train_loss_fn, scaler, amp_dtype,
+                num_epochs=local_epochs, log=True,
+                mix_transform=mix_transform,
+                fedprox=fedprox, mu=mu, snap=snap
+            )
+
+            client_metrics.append({
+                "cid": int(client.cid),
+                "num_samples": int(client.num_samples),
+                "history": hist,
+            })
+            client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
+            client_ns.append(client.num_samples)
+
+        # Aggregate
+        global_params = agg_fn(client_states, client_ns, device="cpu")
+        global_model.load_state_dict(global_params)
+            
+        if (r % eval_every) == 0 or (r == num_rounds-1):
+            va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+            tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
+
+            print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f} train loss {tr['loss']:.4f} acc {tr['acc']:.4f}")
+ 
+    return global_model

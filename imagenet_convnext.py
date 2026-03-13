@@ -43,7 +43,7 @@ rand_erase_mode="pixel"
 rand_erase_count=1
 cutmix_alpha = 1.0
 mixup_alpha = 0.4 #0.8
-mix_prob = 0.8
+mix_prob = 0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
 color_jitter = 0.4
@@ -148,7 +148,7 @@ mix_transform = Mixup(
     switch_prob=mix_switch_prob,
     mode=mix_mode,
     label_smoothing=label_smoothing,
-    num_classes=1000, 
+    num_classes=100, 
 )
 
 ctx = init_run("imagenet_convnext_fl", cfg)

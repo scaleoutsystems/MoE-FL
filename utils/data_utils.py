@@ -28,33 +28,32 @@ SUBSET_CLASSES = [
     "flagpole", "fountain", "mailbox", "park bench", "parking meter",
     "picket fence", "solar dish", "sundial", "traffic light", "street sign",
 ]
-
-
-class ImageNetSubset(Subset):
+    
+class ImageNetSubset(ImageNet):
     """ImageNet filtered to a 100-class outdoor subset, with labels remapped to 0-99."""
 
     def __init__(self, root, split="train", transform=None):
-        base = ImageNet(root=root, split=split, transform=transform)
+        super().__init__(root=root, split=split, transform=transform)
 
-        # Match class names to ImageNet indices
         matched = {}
         missing = []
         for name in SUBSET_CLASSES:
-            if name in base.class_to_idx:
-                matched[name] = base.class_to_idx[name]
+            if name in self.class_to_idx:
+                matched[name] = self.class_to_idx[name]
             else:
                 missing.append(name)
         if missing:
             raise ValueError(f"Could not find {len(missing)} classes in ImageNet: {missing}")
-        
+
         target_indices = set(matched.values())
         self.label_map = {old: new for new, old in enumerate(sorted(target_indices))}
         self.classes = dict(sorted({self.label_map[idx]: name for name, idx in matched.items()}.items()))
         self.num_classes = len(self.classes)
-        self.targets = [self.label_map[label] for _, label in base.samples if label in target_indices]
-        filtered = [i for i, (_, label) in enumerate(base.samples) if label in target_indices]
-        
-        super().__init__(base, filtered)
+
+        # Filter samples and imgs in-place
+        self.samples = [(p, l) for p, l in self.samples if l in target_indices]
+        self.imgs = [(p, self.label_map[l]) for p, l in self.samples]
+        self.targets = [self.label_map[l] for _, l in self.samples]
 
     def __getitem__(self, idx):
         img, label = super().__getitem__(idx)

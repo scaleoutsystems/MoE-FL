@@ -194,7 +194,7 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio)
+    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,collect_expert_stats=True)
 
 global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,

@@ -2,17 +2,18 @@ import torch
 import torch.nn as nn
 from functools import partial
 from typing import Callable, Optional
-from torchvision.ops import StochasticDepth, Permute
+from torchvision.ops import Permute
 from .routers import NoisyTopKRouter
 from .patch_dispatcher import PatchDispatcher
 from torchvision.models.convnext import CNBlock
 from torchvision.models import convnext_tiny 
 
 class MoEConvNeXtWrapper(nn.Module):
-    def __init__(self, base: nn.Module):
+    def __init__(self, base: nn.Module, collect_expert_stats):
         super().__init__()
         self.base = base
-        self._aux_modules = [m for m in self.base.modules() if hasattr(m, "aux_loss")]
+        self._moe_modules = [m for m in self.base.modules() if hasattr(m, "aux_loss")]
+        self.collect_expert_stats = collect_expert_stats
 
     def forward(self, x, return_aux: bool = False):
         logits = self.base(x)
@@ -22,7 +23,7 @@ class MoEConvNeXtWrapper(nn.Module):
 
     def get_aux_loss(self):
         aux = None
-        for m in self._aux_modules:
+        for m in self._moe_modules:
             a = m.aux_loss
             if a is None:
                 continue
@@ -30,6 +31,15 @@ class MoEConvNeXtWrapper(nn.Module):
         if aux is None:
             aux = next(self.base.parameters()).new_zeros(())
         return aux
+    
+    def get_reset_expert_stats(self):
+        stats = []
+        #Append stats for each moe layer
+        for m in self._moe_modules:
+            stats.append(m.expert_stats)
+            m.expert_stats = torch.zeros(m.num_experts)
+        return stats
+    
 
 class MoECNBlock(nn.Module, PatchDispatcher): 
     def __init__(
@@ -40,12 +50,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         mlp_ratio: int,
         capacity_ratio : float,
         layer_scale: float,
-        stochastic_depth_prob: float,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
     ):
         super().__init__()
-        #This only get enabled when expert activation stats are collected
-        self.collect_expert_stats = False
         
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -62,9 +69,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = capacity_ratio
         self.num_experts = num_experts
+        self.expert_stats = torch.zeros(self.num_experts)
 
         self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
-        #self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
 
     def forward(self, input):
         x = self.dwconv(input)  # (N, H, W, C)
@@ -87,7 +94,6 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         moe_out = self.permute_back(moe_out)  # (N, C, H, W)
 
         moe_out = self.layer_scale * moe_out
-        #moe_out = self.stochastic_depth(moe_out)
         
         return input + x_skip + moe_out
     
@@ -103,7 +109,7 @@ class ConvNeXtExpert(nn.Module):
     def forward(self, x):
         return self.block(x)
     
-    
+#For convnext_tiny    
 def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ratio=1.0):
     # convnext_tiny stage dims and number of blocks
     stage_depth = {96: 3, 192: 3, 384: 9, 768: 3}
@@ -130,7 +136,6 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
                 top_k=top_k,
                 mlp_ratio=mlp_ratio,
                 layer_scale=layer_scale,
-                stochastic_depth_prob=stochastic_depth_prob,
                 norm_layer=norm_layer,
                 capacity_ratio=capacity_ratio,
             )
@@ -145,11 +150,12 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
     return block
 
 # Model factory 
-def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0,num_classes=1000):
+def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0,
+                          collect_expert_stats=False,num_classes=1000):
     block_factory = make_last_block_moe_factory(
         num_experts=num_experts,
         top_k=top_k,
         mlp_ratio=mlp_ratio,
         capacity_ratio=capacity_ratio,
     )
-    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=num_classes, block=block_factory))
+    return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=num_classes, block=block_factory),collect_expert_stats)

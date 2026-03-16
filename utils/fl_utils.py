@@ -1,7 +1,7 @@
 import torch
 import threading
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 import ctypes
 
 #We have to force free the RAM
@@ -46,6 +46,58 @@ def fedavg(client_states, client_num_samples, device="cpu"):
             acc.add_(sd[k], alpha=w) 
         agg[k] = acc.to(dtype=t0.dtype)
 
+    return agg
+
+
+def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
+    
+    #Data per client weights
+    total = float(sum(client_num_samples))
+    weights = torch.tensor([n / total for n in client_num_samples])
+    device = torch.device(device)
+    
+    #Normalize expert stats: (num_clients, num_layers, num_experts)
+    eps = 1e-8
+    expert_weights = torch.stack([torch.stack(cs) for cs in moe_stats])
+    expert_weights.div_(expert_weights.sum(dim=-1, keepdim=True) + eps)
+    
+    combined_weights = expert_weights * weights.view(-1, 1, 1)
+    #Renormalize across clients so weights sum to 1 per layer-expert
+    combined_weights.div_(combined_weights.sum(dim=0, keepdim=True) + eps)
+
+    # Build layer to index mapping for experts
+    layer_order = []
+    for k in client_states[0].keys():
+        if "experts" in k.split("."):
+            parts = k.split(".")
+            ei = parts.index("experts")
+            layer_id = f"{parts[ei-2]}.{parts[ei-1]}"
+            if layer_id not in layer_order:
+                layer_order.append(layer_id)
+    layer_to_idx = {l: i for i, l in enumerate(layer_order)}
+
+    #Build (layer_idx, expert_idx) lookup
+    key_info = {}
+    for k in client_states[0].keys():
+        if "experts" in k.split("."):
+            parts = k.split(".")
+            ei = parts.index("experts")
+            layer_id = f"{parts[ei-2]}.{parts[ei-1]}"
+            key_info[k] = (layer_to_idx[layer_id], int(parts[ei+1]))
+
+    agg = {}
+    for k, t0 in client_states[0].items():
+        acc = torch.zeros_like(t0, device=device, dtype=torch.float32)
+        if k in key_info:
+            layer_idx, expert_idx = key_info[k]
+            for client_idx, (w, sd) in enumerate(zip(weights, client_states)):
+                w = combined_weights[client_idx, layer_idx, expert_idx].item()
+                acc.add_(sd[k], alpha=w)
+        else:
+            for w, sd in zip(weights, client_states):
+                acc.add_(sd[k], alpha=w)
+        agg[k] = acc.to(dtype=t0.dtype)
+        
     return agg
 
 @torch.no_grad()
@@ -94,7 +146,6 @@ def lr_schedule(base_lr, start_lr, warmup_rounds, total_rounds, end_lr=0.0):
 def set_lr(optimizer, lr):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
-        
         
 class RawImageSubset(Dataset):
     #Reads raw PIL images from disk, bypassing the dataset's transform
@@ -189,24 +240,10 @@ class Client:
     def free(self):
         self._samples = None
 
-
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
-                 seed=42, shuffle=True, subset=1.0):
+                 seed=42, shuffle=True):
     n = len(dataset)
     indices = np.arange(n)
-
-    if subset < 1.0:
-        targets = np.array(dataset.targets)
-        classes = np.unique(targets)
-        rng = np.random.default_rng(seed)
-        total_subset_size = int(n * subset)
-        per_class = total_subset_size // len(classes)
-        balanced_indices = []
-        for c in classes:
-            class_idxs = np.where(targets == c)[0]
-            rng.shuffle(class_idxs)
-            balanced_indices.append(class_idxs[:per_class])
-        indices = np.concatenate(balanced_indices)
 
     if shuffle:
         rng = np.random.default_rng(seed)

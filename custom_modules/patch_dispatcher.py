@@ -50,11 +50,13 @@ class PatchDispatcher:
         offsets = torch.cumsum(counts, dim=0)
         starts  = offsets - counts
         
-        if self.collect_expert_stats:
-            self._last_routing = (expert_id.cpu(), token_idx.cpu(), T)
+        if self.training:
+            self.expert_stats += counts.detach().cpu()
+        else: 
+           #This exists to accumulate activation stats over classes with the evaluate() function
+           self._last_routing = (expert_id.cpu(), token_idx.cpu(), T)
         
         #Build padded input tensor
-        # slot[e, pos] = which position within expert e's chunk this route occupies
         pos_in_chunk = torch.arange(token_idx.numel(), device=device) - starts[expert_id]
 
         #Gather tokens into padded buffer zero padding fills unused slots
@@ -81,58 +83,3 @@ class PatchDispatcher:
         out.index_add_(0, token_idx, y[expert_id, pos_in_chunk])
 
         return out   
-class MoEStatsCollector:
-    def __init__(self, model, num_classes: int):
-        self.num_classes = num_classes
-        self.layers: dict[str, PatchDispatcher] = {
-            name: module
-            for name, module in model.named_modules()
-            if isinstance(module, PatchDispatcher)
-        }
-
-    def run(self, model, val_loader, device):
-        E = next(iter(self.layers.values())).num_experts
-        accum = {
-            name: {
-                "tokens_kept":       torch.zeros(E, dtype=torch.long),
-                "total_kept":        0,
-                "class_expert_hits": torch.zeros(self.num_classes, E, dtype=torch.long),
-            }
-            for name in self.layers
-        }
-        
-        for layer in self.layers.values():
-            layer.collect_expert_stats = True
-
-        model.eval()
-        with torch.no_grad():
-            for x, labels in val_loader:
-                model(x.to(device))
-                labels_cpu = labels.cpu()
-
-                for name, layer in self.layers.items():
-                    expert_id, token_idx, T = layer._last_routing
-                    patches_per_image = T // labels_cpu.shape[0]
-                    image_idx = token_idx // patches_per_image                   
-                    a = accum[name]
-                    a["tokens_kept"].scatter_add_(0, expert_id, torch.ones_like(expert_id))
-                    a["total_kept"] += expert_id.numel()
-                    token_labels = labels_cpu[image_idx]
-                    idx = token_labels * layer.num_experts + expert_id
-                    a["class_expert_hits"].view(-1).scatter_add_(0, idx, torch.ones_like(idx))
-
-        return {
-            name: self._compute_stats(accum[name], layer.num_experts)
-            for name, layer in self.layers.items()
-        }
-
-    def _compute_stats(self, a, E):
-        expert_activation_pct = (a["tokens_kept"] / (a["total_kept"] + 1e-9)) * 100
-
-        class_totals = a["class_expert_hits"].sum(dim=1, keepdim=True)
-        class_expert_pct = (a["class_expert_hits"] / (class_totals + 1e-9)) * 100
-
-        return {
-            "expert_activation_pct":       expert_activation_pct,       # (E,)
-            "class_expert_activation_pct": class_expert_pct,            # (num_classes, E)
-        }

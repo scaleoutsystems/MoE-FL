@@ -51,10 +51,10 @@ def fedavg(client_states, client_num_samples, device="cpu"):
 
 def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
     
+    device = torch.device(device)
     #Data per client weights
     total = float(sum(client_num_samples))
     weights = torch.tensor([n / total for n in client_num_samples])
-    device = torch.device(device)
     
     #Normalize expert stats: (num_clients, num_layers, num_experts)
     eps = 1e-8

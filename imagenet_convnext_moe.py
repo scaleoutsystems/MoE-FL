@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageNet
+#from torchvision.datasets import ImageNet
 from torchvision import transforms
 
 from timm.loss import SoftTargetCrossEntropy
@@ -13,11 +13,15 @@ from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 from utils.fl_utils import init_clients, lr_schedule
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
+from utils.data_utils import ImageNetSubset
 from custom_modules.convnext_moe import convnext_moe_model_fn
 
 #Reproducability and GPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
+
+#There are graph breaks in the MoE model this allows torch.compile to work better
+torch._dynamo.config.cache_size_limit = 64
 
 seed=42
 num_clients = 20
@@ -160,8 +164,8 @@ ctx = init_run("imagenet_convnext_moe_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-train = ImageNet(root='data',split='train', transform=None)
-val = ImageNet(root='data',split='val', transform=val_transform)
+train = ImageNetSubset(root='data',split='train', transform=None)
+val = ImageNetSubset(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 
 val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)

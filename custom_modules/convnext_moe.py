@@ -36,8 +36,8 @@ class MoEConvNeXtWrapper(nn.Module):
         stats = []
         #Append stats for each moe layer
         for m in self._moe_modules:
-            stats.append(m.expert_stats)
-            m.expert_stats.zero()
+            stats.append(m.expert_stats.cpu())
+            m.expert_stats.zero_()
         return stats
     
 

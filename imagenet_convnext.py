@@ -22,39 +22,32 @@ print("Running on:", device)
 
 seed=42
 num_clients = 20
-num_rounds = 50
-local_epochs = 10
+num_rounds = 600
+local_epochs = 5
 client_frac = 0.2
 
 batch_size = 64
 base_lr = 0.025
 start_lr = 0.005
-warmup_rounds = 5
+warmup_rounds = 30
 
 label_smoothing = 0.1
 
 fedprox = False
 mu = 0
 
-#Comments are full imagenet augments we reduce for the subset
-auto_augment ="rand-m6-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+#Comments are full imagenet augments we reduce for the subset/FL setting
+auto_augment ="rand-m4-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
 rand_erase_p = 0.15 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
-cutmix_alpha = 1.0
-mixup_alpha = 0.4 #0.8
-mix_prob = 0.6
+cutmix_alpha = 0.5 #1.0
+mixup_alpha = 0.2 #0.8
+mix_prob = 0.3 #0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
 color_jitter = 0.4
 interpolation = "bicubic"
-
-#Adam
-# opt_kwargs = {
-#     "lr": base_lr,
-#     "betas": (0.9, 0.999),
-#     "weight_decay": 0.05,
-# }
 
 #SGD
 opt_kwargs = {

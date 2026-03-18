@@ -20,15 +20,15 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
 seed=42
-num_clients = 100
-num_rounds = 50
-local_epochs = 10
+num_clients = 20
+num_rounds = 600
+local_epochs = 5
 client_frac = 0.2
 
-batch_size = 256
-base_lr = 4e-3
-start_lr = 1e-3
-warmup_rounds = 5
+batch_size = 64
+base_lr = 0.025
+start_lr = 0.005
+warmup_rounds = 30
 
 label_smoothing = 0.1
 
@@ -40,23 +40,19 @@ top_k = 1
 mlp_ratio = 2
 capacity_ratio = 1.0
 
-auto_augment = "rand-m9-mstd0.5-inc1"
-rand_erase_p = 0.25
+#Comments are full imagenet augments we reduce for the subset/FL setting
+auto_augment ="rand-m4-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+rand_erase_p = 0.15 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
-cutmix_alpha = 1.0
-mixup_alpha = 0.8
-mix_prob = 1.0
+cutmix_alpha = 0.5 #1.0
+mixup_alpha = 0.2 #0.8
+mix_prob = 0.3 #0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
 color_jitter = 0.4
 interpolation = "bicubic"
 
-# opt_kwargs = {
-#     "lr": base_lr,
-#     "betas": (0.9, 0.999),
-#     "weight_decay": 0.05,
-# }
 opt_kwargs = {
     "lr": base_lr,
     "momentum": 0.9,
@@ -155,7 +151,7 @@ mix_transform = Mixup(
     switch_prob=mix_switch_prob,
     mode=mix_mode,
     label_smoothing=label_smoothing,
-    num_classes=1000, 
+    num_classes=100, 
 )
 
 ctx = init_run("imagenet_convnext_moe_fl", cfg)
@@ -194,7 +190,8 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,collect_expert_stats=True)
+    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,
+                                 num_classes=100,collect_expert_stats=True)
 
 global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,
@@ -209,7 +206,5 @@ global_model = fl_loop(clients=clients,
                        fl_kwargs=cfg['fed'],
                        opt_kwargs=opt_kwargs)
 
-tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
 va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
 print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

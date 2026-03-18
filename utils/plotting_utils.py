@@ -1,6 +1,8 @@
 import json
 import matplotlib.pyplot as plt
 from matplotlib.offsetbox import AnchoredText
+import matplotlib.cm as cm
+import numpy as np
 
 def plot_training(jsonl_path: str) -> plt.Figure:
     rounds, val_acc, val_loss = [], [], []
@@ -40,7 +42,45 @@ def plot_training(jsonl_path: str) -> plt.Figure:
         ax.spines[["top", "right"]].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig("run_1.png",dpi=800)
+    plt.savefig("figs/run_2_global.png",dpi=800)
+    
+def plot_fl_client_training(log_path: str, metric: str = "acc", figsize=(10, 5)):
+    records = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if "round" not in obj or "cid" not in obj:
+                continue
+            last_epoch = obj["history"][-1]
+            records.append({
+                "round": obj["round"] + 1,
+                "cid":   obj["cid"],
+                "value": last_epoch[metric],
+            })
+
+    clients = sorted(set(r["cid"] for r in records))
+    colors  = cm.tab20(np.linspace(0, 1, len(clients)))
+    cmap    = {cid: colors[i] for i, cid in enumerate(clients)}
+
+    all_rounds = sorted(set(r["round"] for r in records))
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for cid in clients:
+        pts = sorted((r["round"], r["value"]) for r in records if r["cid"] == cid)
+        xs, ys = zip(*pts)
+        ax.plot(xs, ys, color=cmap[cid], linewidth=0.8)
+
+    ax.set_xlabel("Communication round")
+    ax.set_ylabel("Client Accuracy")
+    ax.set_xticks(range(0, all_rounds[-1] + 1, 50))
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    plt.savefig("figs/run_2_clients.png", dpi=800)
 
 
-plot_training("imagenet_convnext_fl_20260314_170908/metrics.jsonl")
+plot_training("imagenet_convnext_fl_20260316_144213/metrics.jsonl")
+plot_fl_client_training("imagenet_convnext_fl_20260316_144213/client_metrics.jsonl")

@@ -164,7 +164,7 @@ ctx = init_run("imagenet_convnext_moe_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
-train = ImageNetSubset(root='data',split='train', transform=None)
+train = ImageNetSubset(root='data',split='train', transform=train_transform)
 val = ImageNetSubset(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 

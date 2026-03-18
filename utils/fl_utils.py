@@ -243,7 +243,6 @@ class Client:
 
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True):
-    dataset.transform = transform
     n = len(dataset)
     indices = np.arange(n)
 

@@ -21,6 +21,8 @@ class MoEConvNeXtWrapper(nn.Module):
             return logits
         return logits, self.get_aux_loss()
 
+    #To make torch.compile not cause recompiles
+    @torch.compiler.disable
     def get_aux_loss(self):
         aux = None
         for m in self._moe_modules:

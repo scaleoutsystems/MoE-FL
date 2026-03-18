@@ -8,7 +8,7 @@ from torchvision import transforms
 
 from torchvision.models import convnext_tiny
 from utils.fl_utils import init_clients, lr_schedule, expert_weighted_fedavg
-from utils.training_utils import evaluate, fl_loop_local
+from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
 from custom_modules.convnext_moe import convnext_moe_model_fn
 
@@ -18,8 +18,8 @@ print("Running on:", device)
 
 seed=42
 num_clients = 20
-num_rounds = 1
-local_epochs = 1
+num_rounds = 300
+local_epochs = 5
 client_frac = 0.2
 
 batch_size = 128
@@ -42,23 +42,23 @@ random_crop_size = 32
 random_flip_prob = 0.5
 
 #Adam
-opt_kwargs = {
-    "lr": base_lr,
-    "betas": (0.9, 0.999),
-    "weight_decay": 0.05,
-}
-
 # opt_kwargs = {
 #     "lr": base_lr,
-#     "momentum": 0.9,
-#     "weight_decay": 3e-4,
-#     "nesterov": True,
+#     "betas": (0.9, 0.999),
+#     "weight_decay": 0.05,
 # }
 
+opt_kwargs = {
+    "lr": base_lr,
+    "momentum": 0.9,
+    "weight_decay": 3e-4,
+    "nesterov": True,
+}
+
 dl_kwargs = {
-    #"num_workers": 8,
+#    "num_workers": 8,
     "pin_memory": (device == "cuda"),
-    #"prefetch_factor": 4,
+#    "prefetch_factor": 4,
     "drop_last": True,
 }
 
@@ -149,13 +149,13 @@ train_loss_fn = nn.CrossEntropyLoss()
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 def opt_fn(model, opt_kwargs):
-    return torch.optim.AdamW(model.parameters(), **opt_kwargs)
-    #return torch.optim.SGD(model.parameters(), **opt_kwargs)
+    #return torch.optim.AdamW(model.parameters(), **opt_kwargs)
+    return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
     return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,num_classes=10,collect_expert_stats=True) #convnext_tiny(weights=None,num_classes=10)#
 
-global_model = fl_loop_local(clients=clients, 
+global_model = fl_loop(clients=clients, 
                        model_fn=model_fn,
                        opt_fn = opt_fn,
                        train_loss_fn=train_loss_fn,
@@ -163,24 +163,24 @@ global_model = fl_loop_local(clients=clients,
                        lr_sched=lr_sched,
                        mix_transform=None,
                        val_loader=val_loader,
-                       train_eval_loader=train_eval_loader,
                        device=device,
                        ctx=ctx,
                        eval_every=5,
                        fl_kwargs=cfg['fed'],
                        opt_kwargs=opt_kwargs,
-                       agg_fn=expert_weighted_fedavg)
+                       agg_fn=expert_weighted_fedavg,
+                       amp_dtype=torch.float16)
 
 tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn,moe_stats=False)
 va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn,moe_stats=True)
 print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
 print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
 
-if "moe_stats" in va:
-    for layer_name, stats in va["moe_stats"].items():
-        print(f"\n  [{layer_name}]")
-        pct = stats["expert_activation_pct"]
-        print(f"  Overall: " + " | ".join(f"E{i}:{p:.1f}%" for i, p in enumerate(pct.tolist())))
-        print(f"  Per label:")
-        for label_idx, row in enumerate(stats["class_expert_activation_pct"].tolist()):
-            print(f"    cls {label_idx:>3}: " + " | ".join(f"E{i}:{p:.1f}%" for i, p in enumerate(row)))
+# if "moe_stats" in va:
+#     for layer_name, stats in va["moe_stats"].items():
+#         print(f"\n  [{layer_name}]")
+#         pct = stats["expert_activation_pct"]
+#         print(f"  Overall: " + " | ".join(f"E{i}:{p:.1f}%" for i, p in enumerate(pct.tolist())))
+#         print(f"  Per label:")
+#         for label_idx, row in enumerate(stats["class_expert_activation_pct"].tolist()):
+#             print(f"    cls {label_idx:>3}: " + " | ".join(f"E{i}:{p:.1f}%" for i, p in enumerate(row)))

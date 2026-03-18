@@ -216,32 +216,34 @@ class Client:
         self._thread = threading.Thread(target=_load, daemon=True)
         self._thread.start()
 
-    def get_loader(self):
-        self._thread.join()
-        if self._error:
-            raise RuntimeError(f"Client {self.cid} prefetch failed: {self._error}")
-        release_memory()
-        ram_dl_kwargs = {
-            **self._dl_kwargs,
-            "num_workers": 9,
-            "prefetch_factor": 2,
-            "persistent_workers": True,
-        }
-        return DataLoader(
-            InMemoryDataset(self._samples, self._transform),
-            batch_size=self._batch_size,
-            shuffle=True,
-            **ram_dl_kwargs
-        )
-        #uncomment for local testing instead of code above
-        # subset = Subset(self._dataset, self.subset)
-        # return DataLoader(subset, batch_size=self._batch_size, shuffle=True, **self._dl_kwargs)
+    def get_loader(self,in_memory=False):
+        if in_memory:
+            self._thread.join()
+            if self._error:
+                raise RuntimeError(f"Client {self.cid} prefetch failed: {self._error}")
+            release_memory()
+            ram_dl_kwargs = {
+                **self._dl_kwargs,
+                "num_workers": 9,
+                "prefetch_factor": 2,
+                "persistent_workers": True,
+            }
+            return DataLoader(
+                InMemoryDataset(self._samples, self._transform),
+                batch_size=self._batch_size,
+                shuffle=True,
+                **ram_dl_kwargs
+            )
+        else:
+            subset = Subset(self._dataset, self.subset)
+            return DataLoader(subset, batch_size=self._batch_size, shuffle=True, **self._dl_kwargs)
 
     def free(self):
         self._samples = None
 
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True):
+    dataset.transform = transform
     n = len(dataset)
     indices = np.arange(n)
 

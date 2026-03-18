@@ -51,7 +51,7 @@ class PatchDispatcher:
         starts  = offsets - counts
         
         if self.training:
-            self.expert_stats += counts.detach().cpu()
+            self.expert_stats += counts.detach()
         else: 
            #This exists to accumulate activation stats over classes with the evaluate() function
            self._last_routing = (expert_id.cpu(), token_idx.cpu(), T)

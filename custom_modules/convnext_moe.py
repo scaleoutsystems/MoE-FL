@@ -32,12 +32,12 @@ class MoEConvNeXtWrapper(nn.Module):
             aux = next(self.base.parameters()).new_zeros(())
         return aux
     
-    def get_reset_expert_stats(self):
+    def pop_expert_stats(self):
         stats = []
         #Append stats for each moe layer
         for m in self._moe_modules:
             stats.append(m.expert_stats)
-            m.expert_stats = torch.zeros(m.num_experts)
+            m.expert_stats.zero()
         return stats
     
 
@@ -69,10 +69,13 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = capacity_ratio
         self.num_experts = num_experts
-        self.expert_stats = torch.zeros(self.num_experts)
+        #self.expert_stats = torch.zeros(self.num_experts)
+        self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
 
         self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
 
+    #This module may not work well with torch.compile
+    @torch.compiler.disable
     def forward(self, input):
         x = self.dwconv(input)  # (N, H, W, C)
         N, H, W, C = x.shape

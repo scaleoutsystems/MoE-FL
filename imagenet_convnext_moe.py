@@ -67,6 +67,8 @@ dl_kwargs = {
     "drop_last": True,
 }
 
+val_dl_kwargs = {**dl_kwargs, "drop_last": False}
+
 cfg = {
     "seed": seed,
     "fed": {
@@ -162,8 +164,7 @@ train = ImageNet(root='data',split='train', transform=None)
 val = ImageNet(root='data',split='val', transform=val_transform)
 
 #Global eval loaders 
-train_eval_loader = DataLoader(train, batch_size=batch_size, shuffle=False, **dl_kwargs)
-val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
+val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
 print("Data loaded")
 
 # Client loaders 

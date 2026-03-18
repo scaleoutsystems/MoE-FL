@@ -1,12 +1,13 @@
 import torch
 import math
 import random
+import gc
+import multiprocessing as mp
 from copy import deepcopy
 from functools import partial
 from torch.amp import autocast, GradScaler
 from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
 from .experiment_tracking import log_and_checkpoint, log_client_metrics
-import gc
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
@@ -115,116 +116,6 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
 
     return history
     
-def fl_loop(clients,model_fn,opt_fn,
-            train_loss_fn,eval_loss_fn,
-            lr_sched,mix_transform,
-            val_loader,device,
-            ctx,fl_kwargs,opt_kwargs,
-            eval_every=1, agg_fn=fedavg,
-            amp_dtype=torch.bfloat16):
-    
-    client_frac = fl_kwargs['client_frac']
-    num_clients = fl_kwargs['num_clients']
-    num_rounds = fl_kwargs['num_rounds']
-    local_epochs = fl_kwargs['local_epochs']
-    fedprox = fl_kwargs['fedprox']
-    mu = fl_kwargs['mu']
-    
-    global_model = torch.compile(model_fn().to(device))
-    local_model = torch.compile(model_fn().to(device))
-    global_params = deepcopy(global_model.state_dict())
-    
-    collect_expert_stats = getattr(global_model, "collect_expert_stats", False)
-    
-    if amp_dtype == torch.float16:
-        scaler = GradScaler(device=device)
-    else:
-        scaler = None
-
-    # Federated loop
-    for r in range(num_rounds):
-        print(f"\n=== Round {r} ===")
-        lr_r = float(lr_sched[r])
-        client_states, client_ns, client_metrics = [], [], []
-        
-        if collect_expert_stats:
-            client_expert_stats = []
-        
-        m = int(max(1, math.ceil(client_frac * num_clients)))
-        selected_clients = random.sample(clients,k=m)
-        
-        #Global model snapshot for fedprox
-        if fedprox:
-            snap = snapshot_params_fp32(global_model,device)
-        else:
-            snap = None
-
-        selected_clients[0].prefetch()
-
-        for i, client in enumerate(selected_clients):
-            print(f"Client {client.cid}")
-            loader = client.get_loader()
-            if i + 1 < len(selected_clients):
-                selected_clients[i + 1].prefetch()
-
-            local_model.load_state_dict(global_params)
-            optimizer = opt_fn(local_model, opt_kwargs)
-            set_lr(optimizer, lr_r)
-
-            hist = train_client(
-                local_model, loader, device, optimizer,
-                train_loss_fn, scaler, amp_dtype,
-                num_epochs=local_epochs, log=True,
-                mix_transform=mix_transform,
-                fedprox=fedprox, mu=mu, snap=snap
-            )
-            
-            metric = {"cid": int(client.cid),
-                "num_samples": int(client.num_samples),
-                "history": hist,}
-            
-            if collect_expert_stats:
-                moe_stats = local_model.get_reset_expert_stats()
-                metric["moe_stats"] = moe_stats
-                client_expert_stats.append(moe_stats)
-
-            client_metrics.append(metric)
-            client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
-            client_ns.append(client.num_samples)
-
-            del loader #Delete the loader to not go over number of CPU cores available
-            gc.collect()
-            client.free()  #release RAM
-
-        log_client_metrics(ctx,r,client_metrics)
-        
-        if collect_expert_stats:
-            agg_fn = partial(agg_fn, moe_stats=client_expert_stats)
-        
-        # Aggregate
-        global_params = agg_fn(client_states, client_ns,device="cpu")
-        global_model.load_state_dict(global_params)
-            
-        if (r % eval_every) == 0 or (r == num_rounds-1):
-            va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-
-            print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f}")
-            
-            metrics = {
-                "lr": lr_r,
-                "val_loss": float(va["loss"]),
-                "val_acc": float(va["acc"]),
-            }
-
-            saved = log_and_checkpoint(ctx,r,metrics,global_model, 
-                                    ema_model=None, best_key="val_acc", mode="max",)
-
-            if saved:
-                print(f"New best at round {r}: {metrics['val_acc']:.4f}")
-        
-    return global_model
-
-
 @torch.no_grad()
 def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
     model.eval()
@@ -275,90 +166,263 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
         }
         
     return result
-    
-#For local testing
-# def fl_loop_local(clients,model_fn,opt_fn,
-#             train_loss_fn,eval_loss_fn,
-#             lr_sched,mix_transform,
-#             val_loader,train_eval_loader,device,
-#             ctx,fl_kwargs,opt_kwargs,
-#             eval_every=1, agg_fn=fedavg,
-#             amp_dtype=torch.float16):
-    
-#     client_frac = fl_kwargs['client_frac']
-#     num_clients = fl_kwargs['num_clients']
-#     num_rounds = fl_kwargs['num_rounds']
-#     local_epochs = fl_kwargs['local_epochs']
-#     fedprox = fl_kwargs['fedprox']
-#     mu = fl_kwargs['mu']
-    
-#     global_model = model_fn().to(device)
-#     local_model = model_fn().to(device)
-#     global_params = deepcopy(global_model.state_dict())
-    
-#     collect_stats = getattr(global_model, "collect_expert_stats", False)
-    
-#     if amp_dtype == torch.float16:
-#         scaler = GradScaler(device=device)
-#     else:
-#         scaler = None
 
-#     # Federated loop
-#     for r in range(num_rounds):
-#         print(f"\n=== Round {r} ===")
-#         lr_r = float(lr_sched[r])
-#         client_states, client_ns, client_metrics = [], [], []
+def run_clients_multi_gpu(selected_clients, local_model, global_params, opt_fn, opt_kwargs,
+                          lr_r, train_loss_fn, local_epochs, mix_transform,
+                          fedprox, mu, snap, amp_dtype, collect_expert_stats, num_gpus, **_):
+    
+    
+    snap_cpu = [p.detach().cpu() for p in snap] if (fedprox and snap is not None) else None
+    result_queue = mp.Queue()
+    
+    local_models = [deepcopy(local_model).to(f"cuda:{rank}") for rank in range(num_gpus)]
+
+    for batch_start in range(0, len(selected_clients), num_gpus):
+        batch = selected_clients[batch_start : batch_start + num_gpus]
+        processes = []
+
+        for rank, client in enumerate(batch):
+            print(f"Client {client.cid} -> cuda:{rank}")
+            p = mp.Process(
+                target=_client_worker,
+                args=(rank, client, local_models[rank], global_params, opt_fn, 
+                      opt_kwargs, lr_r, train_loss_fn, local_epochs, mix_transform,
+                      fedprox, mu, snap_cpu, amp_dtype, collect_expert_stats,
+                      result_queue),
+                daemon=True,
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+    results = []
+    while not result_queue.empty():
+        results.append(result_queue.get())
+
+    return results
+
+def _client_worker(rank, client,local_model, global_params, opt_fn, opt_kwargs,
+                   lr_r, train_loss_fn, local_epochs, mix_transform,
+                   fedprox, mu, snap_cpu, amp_dtype, collect_expert_stats,
+                   result_queue):
+    device = torch.device(f"cuda:{rank}")
+
+    local_model.load_state_dict({k: v.to(device) for k, v in global_params.items()})
+
+    optimizer = opt_fn(local_model, opt_kwargs)
+    set_lr(optimizer, lr_r)
+
+    scaler = GradScaler(device=device) if amp_dtype == torch.float16 else None
+    snap = [p.to(device) for p in snap_cpu] if (fedprox and snap_cpu is not None) else None
+
+    loader = client.get_loader(in_memory=False)
+
+    hist = train_client(
+        local_model, loader, device, optimizer,
+        train_loss_fn, scaler, amp_dtype,
+        num_epochs=local_epochs, log=False,
+        mix_transform=mix_transform,
+        fedprox=fedprox, mu=mu, snap=snap,
+    )
+
+    result = {
+        "cid": client.cid,
+        "num_samples": client.num_samples,
+        "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
+        "history": hist,
+    }
+
+    if collect_expert_stats:
+        result["moe_stats"] = local_model.pop_expert_stats()
+
+    result_queue.put(result)
+    torch.cuda.empty_cache()
+
+#This should be used for single gpu with I/O bottleneck
+def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_fn, opt_kwargs,
+                               lr_r, train_loss_fn, local_epochs, mix_transform,
+                               fedprox, mu, snap, scaler, amp_dtype, device,
+                               collect_expert_stats, **_):
+    
+    results = []
+    selected_clients[0].prefetch()
+
+    for i, client in enumerate(selected_clients):
+        print(f"Client {client.cid}")
+        loader = client.get_loader(in_memory=True)
+        if i + 1 < len(selected_clients):
+            selected_clients[i + 1].prefetch()
+
+        local_model.load_state_dict(global_params)
+        optimizer = opt_fn(local_model, opt_kwargs)
+        set_lr(optimizer, lr_r)
+
+        hist = train_client(
+            local_model, loader, device, optimizer,
+            train_loss_fn, scaler, amp_dtype,
+            num_epochs=local_epochs, log=True,
+            mix_transform=mix_transform,
+            fedprox=fedprox, mu=mu, snap=snap
+        )
         
-#         if collect_stats:
-#             client_expert_stats = []
+        result = {
+            "cid": client.cid,
+            "num_samples": client.num_samples,
+            "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
+            "history": hist,
+        }
+
+        if collect_expert_stats:
+            result["moe_stats"] = local_model.pop_expert_stats()
+
+        results.append(result)
+        del loader #Delete the loader to not go over number of CPU cores available
+        gc.collect()
+        client.free() #release RAM
+
+    return results
+          
+
+def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, opt_kwargs,
+                            lr_r, train_loss_fn, local_epochs, mix_transform,
+                            fedprox, mu, snap, scaler, amp_dtype, device,
+                            collect_expert_stats, **_):
+    results = []
+
+    for client in selected_clients:
+        print(f"Client {client.cid}")
+        loader = client.get_loader(in_memory=False)
+
+        local_model.load_state_dict(global_params)
+        optimizer = opt_fn(local_model, opt_kwargs)
+        set_lr(optimizer, lr_r)
+
+        hist = train_client(
+            local_model, loader, device, optimizer,
+            train_loss_fn, scaler, amp_dtype,
+            num_epochs=local_epochs, log=True,
+            mix_transform=mix_transform,
+            fedprox=fedprox, mu=mu, snap=snap
+        )
         
-#         m = int(max(1, math.ceil(client_frac * num_clients)))
-#         selected_clients = random.sample(clients,k=m)
+        result = {
+            "cid": client.cid,
+            "num_samples": client.num_samples,
+            "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
+            "history": hist,
+        }
+
+        if collect_expert_stats:
+            result["moe_stats"] = local_model.pop_expert_stats()
+
+        results.append(result)
+
+    return results
+
+def run_clients(selected_clients, num_gpus, io_bottleneck, **kwargs):
+    
+    if num_gpus > 1:
+        return run_clients_multi_gpu(selected_clients,num_gpus=num_gpus, **kwargs)
+    if num_gpus == 1 and io_bottleneck:
+        return  run_clients_io_bottleneck(selected_clients, **kwargs)
+    else:
+        return run_clients_single_gpu(selected_clients, **kwargs)
+
+def fl_loop(clients,model_fn,opt_fn,
+            train_loss_fn,eval_loss_fn,
+            lr_sched,mix_transform,
+            val_loader,device,
+            ctx,fl_kwargs,opt_kwargs,
+            eval_every=1, agg_fn=fedavg,
+            amp_dtype=torch.bfloat16, 
+            num_gpus=1, io_bottleneck=False):
+    
+    client_frac = fl_kwargs['client_frac']
+    num_clients = fl_kwargs['num_clients']
+    num_rounds = fl_kwargs['num_rounds']
+    local_epochs = fl_kwargs['local_epochs']
+    fedprox = fl_kwargs['fedprox']
+    mu = fl_kwargs['mu']
+    
+    global_model = torch.compile(model_fn().to(device))
+    local_model = torch.compile(model_fn().to(device))
+    global_params = deepcopy(global_model.state_dict())
+    
+    collect_expert_stats = getattr(global_model, "collect_expert_stats", False)
+    
+    if amp_dtype == torch.float16:
+        scaler = GradScaler(device=device)
+    else:
+        scaler = None
+
+    # Federated loop
+    for r in range(num_rounds):
+        print(f"\n=== Round {r} ===")
         
-#         #Global model snapshot for fedprox
-#         if fedprox:
-#             snap = snapshot_params_fp32(global_model,device)
-#         else:
-#             snap = None
+        lr_r = float(lr_sched[r])
+        m = int(max(1, math.ceil(client_frac * num_clients)))
+        selected_clients = random.sample(clients,k=m)
+        
+        #Global model snapshot for fedprox
+        if fedprox:
+            snap = snapshot_params_fp32(global_model,device)
+        else:
+            snap = None
 
-#         for client in selected_clients:
+        results = run_clients(
+            selected_clients=selected_clients,
+            num_gpus=num_gpus,
+            io_bottleneck=io_bottleneck,
+            local_model=local_model,
+            global_params=global_params,
+            opt_fn=opt_fn,
+            opt_kwargs=opt_kwargs,
+            lr_r=lr_r,
+            train_loss_fn=train_loss_fn,
+            local_epochs=local_epochs,
+            mix_transform=mix_transform,
+            fedprox=fedprox, mu=mu, snap=snap,
+            scaler=scaler,
+            amp_dtype=amp_dtype,
+            device=device,
+            collect_expert_stats=collect_expert_stats
+        )
 
-#             local_model.load_state_dict(global_params)
-#             optimizer = opt_fn(local_model, opt_kwargs)
-#             set_lr(optimizer, lr_r)
+        client_states = [r["state"] for r in results]
+        client_ns     = [r["num_samples"] for r in results]
+        client_metrics = [{"cid": r["cid"], "num_samples": r["num_samples"],
+                           "history": r["history"]} for r in results]
 
-#             hist = train_client(
-#                 local_model, client.get_loader(), device, optimizer,
-#                 train_loss_fn, scaler, amp_dtype,
-#                 num_epochs=local_epochs, log=True,
-#                 mix_transform=mix_transform,
-#                 fedprox=fedprox, mu=mu, snap=snap
-#             )
+        if collect_expert_stats:
+            client_expert_stats = [r["moe_stats"] for r in results]
+            agg_fn = partial(agg_fn, moe_stats=client_expert_stats) 
 
-#             metric = {"cid": int(client.cid),
-#                 "num_samples": int(client.num_samples),
-#                 "history": hist,}
+        log_client_metrics(ctx,r,client_metrics)
+        
+        if collect_expert_stats:
+            agg_fn = partial(agg_fn, moe_stats=client_expert_stats)
+        
+        # Aggregate
+        global_params = agg_fn(client_states, client_ns,device="cpu")
+        global_model.load_state_dict(global_params)
             
-#             if collect_stats:
-#                 moe_stats = local_model.get_reset_expert_stats()
-#                 metric["moe_stats"] = moe_stats
-#                 client_expert_stats.append(moe_stats)
+        if (r % eval_every) == 0 or (r == num_rounds-1):
+            va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
 
-#             client_metrics.append(metric)
-#             client_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
-#             client_ns.append(client.num_samples)
-
-#         if collect_stats:
-#             agg_fn = partial(agg_fn, moe_stats=client_expert_stats)
-        
-#         # Aggregate
-#         global_params = agg_fn(client_states, client_ns, device="cpu")
-#         global_model.load_state_dict(global_params)
+            print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f}")
             
-#         if (r % eval_every) == 0 or (r == num_rounds-1):
-#             va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-#             tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
+            metrics = {
+                "lr": lr_r,
+                "val_loss": float(va["loss"]),
+                "val_acc": float(va["acc"]),
+            }
 
-#             print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f} train loss {tr['loss']:.4f} acc {tr['acc']:.4f}")
- 
-#     return global_model
+            saved = log_and_checkpoint(ctx,r,metrics,global_model, 
+                                    ema_model=None, best_key="val_acc", mode="max",)
+
+            if saved:
+                print(f"New best at round {r}: {metrics['val_acc']:.4f}")
+        
+    return global_model

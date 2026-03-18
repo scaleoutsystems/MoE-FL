@@ -64,6 +64,8 @@ dl_kwargs = {
     "drop_last": True,
 }
 
+val_dl_kwargs = {**dl_kwargs, "drop_last": False}
+
 cfg = {
     "seed": seed,
     "fed": {
@@ -148,11 +150,13 @@ ctx = init_run("imagenet_convnext_fl", cfg)
 print("Run dir:", ctx["run_dir"])
 
 print("Loading data...")
+
+#Train transform is handled by init_clients
 train = ImageNetSubset(root='data', split='train', transform=None)
 val = ImageNetSubset(root='data',split='val', transform=val_transform)
 
 #Global eval loader
-val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
+val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
 print("Data loaded")
 
 clients = init_clients(

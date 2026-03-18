@@ -58,12 +58,16 @@ def init_run(name, config, run_root = "runs", run_id = None):
         "client_metrics_path": client_metrics_path,
         "best": None,  
     }
+    
+def get_uncompiled_state_dict(model):
+    m = getattr(model, "_orig_mod", model)  #unwrap if compiled, no-op if not
+    return m.state_dict()
 
 def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None):
     payload = {
         "round": int(round_idx),
-        "global_model": global_model.state_dict(),
-        "ema_model": ema_model.state_dict() if ema_model is not None else None,
+        "global_model": get_uncompiled_state_dict(global_model),
+        "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None,
         "metrics": metrics or {},
     }
 
@@ -89,8 +93,8 @@ def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics
     payload = {
         "round": int(round_idx),
         "best_score": score,
-        "global_model": global_model.state_dict(),
-        "ema_model": ema_model.state_dict() if ema_model is not None else None,
+        "global_model": get_uncompiled_state_dict(global_model),
+        "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None, 
         "metrics": metrics or {},
     }
 

@@ -235,8 +235,9 @@ class Client:
                 **ram_dl_kwargs
             )
         else:
+            client_dl_kwargs = {**self._dl_kwargs, "pin_memory":False}
             subset = Subset(self._dataset, self.subset)
-            return DataLoader(subset, batch_size=self._batch_size, shuffle=True, **self._dl_kwargs)
+            return DataLoader(subset, batch_size=self._batch_size, shuffle=True, **client_dl_kwargs)
 
     def free(self):
         self._samples = None

@@ -2,7 +2,7 @@ import torch
 import math
 import random
 import gc
-import multiprocessing as mp
+import ray
 from copy import deepcopy
 from functools import partial
 from torch.amp import autocast, GradScaler
@@ -167,78 +167,68 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
         
     return result
 
-def run_clients_multi_gpu(selected_clients, local_model, global_params, opt_fn, opt_kwargs,
-                          lr_r, train_loss_fn, local_epochs, mix_transform,
-                          fedprox, mu, snap, amp_dtype, collect_expert_stats, num_gpus, **_):
+
+@ray.remote(num_gpus=1)
+class ClientWorker:
+    def __init__(self, model_fn, amp_dtype):
+        self.device = torch.device("cuda:0")  # Ray assigns 1 GPU per actor
+        self.model = torch.compile(model_fn().to(self.device))
+        self.amp_dtype = amp_dtype
+        self.scaler = GradScaler(device=self.device) if amp_dtype == torch.float16 else None
+
+    def train(self, client, global_params, opt_fn, opt_kwargs, lr_r,
+              train_loss_fn, local_epochs, mix_transform,
+              fedprox, mu, snap_cpu, collect_expert_stats):
+
+        self.model.load_state_dict({k: v.to(self.device) for k, v in global_params.items()})
+        optimizer = opt_fn(self.model, opt_kwargs)
+        set_lr(optimizer, lr_r)
+        snap = [p.to(self.device) for p in snap_cpu] if snap_cpu else None
+        loader = client.get_loader(in_memory=False)
+
+        hist = train_client(
+            self.model, loader, self.device, optimizer,
+            train_loss_fn, self.scaler, self.amp_dtype,
+            num_epochs=local_epochs, log=True,
+            mix_transform=mix_transform,
+            fedprox=fedprox, mu=mu, snap=snap,
+        )
+
+        result = {
+            "cid": client.cid,
+            "num_samples": client.num_samples,
+            "state": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
+            "history": hist,
+        }
+
+        if collect_expert_stats:
+            result["moe_stats"] = self.model.pop_expert_stats()
+
+        return result
     
-    
+def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_kwargs,
+                    lr_r, train_loss_fn, local_epochs, mix_transform,
+                    fedprox, mu, snap, collect_expert_stats, num_gpus, **_):
+
     snap_cpu = [p.detach().cpu() for p in snap] if (fedprox and snap is not None) else None
-    result_queue = mp.Queue()
-    
-    local_models = [deepcopy(local_model).to(f"cuda:{rank}") for rank in range(num_gpus)]
+    results = []
 
     for batch_start in range(0, len(selected_clients), num_gpus):
         batch = selected_clients[batch_start : batch_start + num_gpus]
-        processes = []
 
-        for rank, client in enumerate(batch):
-            print(f"Client {client.cid} -> cuda:{rank}")
-            p = mp.Process(
-                target=_client_worker,
-                args=(rank, client, local_models[rank], global_params, opt_fn, 
-                      opt_kwargs, lr_r, train_loss_fn, local_epochs, mix_transform,
-                      fedprox, mu, snap_cpu, amp_dtype, collect_expert_stats,
-                      result_queue),
-                daemon=True,
+        futures = [
+            workers[rank].train.remote(
+                client, global_params, opt_fn, opt_kwargs, lr_r,
+                train_loss_fn, local_epochs, mix_transform,
+                fedprox, mu, snap_cpu, collect_expert_stats
             )
-            p.start()
-            processes.append(p)
+            for rank, client in enumerate(batch)
+        ]
 
-        for p in processes:
-            p.join()
-
-    results = []
-    while not result_queue.empty():
-        results.append(result_queue.get())
+        batch_results = ray.get(futures)
+        results.extend(batch_results)
 
     return results
-
-def _client_worker(rank, client,local_model, global_params, opt_fn, opt_kwargs,
-                   lr_r, train_loss_fn, local_epochs, mix_transform,
-                   fedprox, mu, snap_cpu, amp_dtype, collect_expert_stats,
-                   result_queue):
-    device = torch.device(f"cuda:{rank}")
-
-    local_model.load_state_dict({k: v.to(device) for k, v in global_params.items()})
-
-    optimizer = opt_fn(local_model, opt_kwargs)
-    set_lr(optimizer, lr_r)
-
-    scaler = GradScaler(device=device) if amp_dtype == torch.float16 else None
-    snap = [p.to(device) for p in snap_cpu] if (fedprox and snap_cpu is not None) else None
-
-    loader = client.get_loader(in_memory=False)
-
-    hist = train_client(
-        local_model, loader, device, optimizer,
-        train_loss_fn, scaler, amp_dtype,
-        num_epochs=local_epochs, log=False,
-        mix_transform=mix_transform,
-        fedprox=fedprox, mu=mu, snap=snap,
-    )
-
-    result = {
-        "cid": client.cid,
-        "num_samples": client.num_samples,
-        "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
-        "history": hist,
-    }
-
-    if collect_expert_stats:
-        result["moe_stats"] = local_model.pop_expert_stats()
-
-    result_queue.put(result)
-    torch.cuda.empty_cache()
 
 #This should be used for single gpu with I/O bottleneck
 def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_fn, opt_kwargs,
@@ -321,10 +311,10 @@ def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, 
 
     return results
 
-def run_clients(selected_clients, num_gpus, io_bottleneck, **kwargs):
+def run_clients(selected_clients, num_gpus, io_bottleneck,workers, **kwargs):
     
     if num_gpus > 1:
-        return run_clients_multi_gpu(selected_clients,num_gpus=num_gpus, **kwargs)
+        return run_clients_multi_gpu(selected_clients,workers=workers,num_gpus=num_gpus, **kwargs)
     if num_gpus == 1 and io_bottleneck:
         return  run_clients_io_bottleneck(selected_clients, **kwargs)
     else:
@@ -347,7 +337,10 @@ def fl_loop(clients,model_fn,opt_fn,
     mu = fl_kwargs['mu']
     
     global_model = torch.compile(model_fn().to(device))
-    local_model = torch.compile(model_fn().to(device))
+    if num_gpus == 1:
+        local_model = torch.compile(model_fn().to(device))
+    else:
+        local_model = None
     global_params = deepcopy(global_model.state_dict())
     
     collect_expert_stats = getattr(global_model, "collect_expert_stats", False)
@@ -356,6 +349,13 @@ def fl_loop(clients,model_fn,opt_fn,
         scaler = GradScaler(device=device)
     else:
         scaler = None
+        
+    if num_gpus > 1:
+        ray.init()
+        workers = [ClientWorker.remote(model_fn, amp_dtype) for _ in range(num_gpus)]
+        print(f"Started {num_gpus} persistent Ray workers", flush=True)
+    else:
+        workers = None
 
     # Federated loop
     for r in range(num_rounds):
@@ -374,6 +374,7 @@ def fl_loop(clients,model_fn,opt_fn,
         results = run_clients(
             selected_clients=selected_clients,
             num_gpus=num_gpus,
+            workers=workers,
             io_bottleneck=io_bottleneck,
             local_model=local_model,
             global_params=global_params,
@@ -397,15 +398,14 @@ def fl_loop(clients,model_fn,opt_fn,
 
         if collect_expert_stats:
             client_expert_stats = [r["moe_stats"] for r in results]
-            agg_fn = partial(agg_fn, moe_stats=client_expert_stats) 
+            round_agg_fn = partial(agg_fn, moe_stats=client_expert_stats) 
+        else:
+            round_agg_fn = agg_fn
 
         log_client_metrics(ctx,r,client_metrics)
         
-        if collect_expert_stats:
-            agg_fn = partial(agg_fn, moe_stats=client_expert_stats)
-        
         # Aggregate
-        global_params = agg_fn(client_states, client_ns,device="cpu")
+        global_params = round_agg_fn(client_states, client_ns,device="cpu")
         global_model.load_state_dict(global_params)
             
         if (r % eval_every) == 0 or (r == num_rounds-1):
@@ -424,5 +424,8 @@ def fl_loop(clients,model_fn,opt_fn,
 
             if saved:
                 print(f"New best at round {r}: {metrics['val_acc']:.4f}")
+                
+    if num_gpus > 1:
+        ray.shutdown()
         
     return global_model

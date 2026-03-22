@@ -10,7 +10,7 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.data import create_transform, Mixup
 from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 
-from utils.fl_utils import init_clients, lr_schedule
+from utils.fl_utils import init_clients, lr_schedule, expert_weighted_fedavg
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
 from utils.data_utils import ImageNetSubset
@@ -160,31 +160,6 @@ mix_transform = Mixup(
     num_classes=100, 
 )
 
-ctx = init_run("imagenet_convnext_moe_fl", cfg)
-print("Run dir:", ctx["run_dir"])
-
-print("Loading data...")
-train = ImageNetSubset(root='data',split='train', transform=train_transform)
-val = ImageNetSubset(root='data',split='val', transform=val_transform)
-
-#Global eval loaders 
-val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
-print("Data loaded")
-
-# Client loaders 
-clients = init_clients(
-    dataset=train,
-    num_clients=num_clients,
-    batch_size=batch_size,
-    dl_kwargs=dl_kwargs,
-    seed=seed,
-    shuffle=True,
-    transform=train_transform
-)
-        
-lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
-                       total_rounds=num_rounds, start_lr=start_lr)
-
 if mix_transform is not None:
     train_loss_fn = SoftTargetCrossEntropy()
 else:
@@ -196,20 +171,48 @@ def opt_fn(model, opt_kwargs):
 
 def model_fn():
     return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,
-                                 num_classes=100,collect_expert_stats=True)
+                                num_classes=100,collect_expert_stats=True)
 
-global_model = fl_loop(clients=clients, 
-                       model_fn=model_fn,
-                       opt_fn = opt_fn,
-                       train_loss_fn=train_loss_fn,
-                       eval_loss_fn=eval_loss_fn,
-                       lr_sched=lr_sched,
-                       mix_transform=mix_transform,
-                       val_loader=val_loader,
-                       device=device,
-                       ctx=ctx,
-                       fl_kwargs=cfg['fed'],
-                       opt_kwargs=opt_kwargs)
+if __name__ == "__main__":
+    ctx = init_run("imagenet_convnext_moe_fl", cfg)
+    print("Run dir:", ctx["run_dir"])
 
-va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+    print("Loading data...")
+    train = ImageNetSubset(root='data',split='train', transform=train_transform)
+    val = ImageNetSubset(root='data',split='val', transform=val_transform)
+
+    #Global eval loaders 
+    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
+    print("Data loaded")
+
+    # Client loaders 
+    clients = init_clients(
+        dataset=train,
+        num_clients=num_clients,
+        batch_size=batch_size,
+        dl_kwargs=dl_kwargs,
+        seed=seed,
+        shuffle=True,
+        transform=train_transform
+    )
+            
+    lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
+                        total_rounds=num_rounds, start_lr=start_lr)
+
+    global_model = fl_loop(clients=clients, 
+                        model_fn=model_fn,
+                        opt_fn = opt_fn,
+                        train_loss_fn=train_loss_fn,
+                        eval_loss_fn=eval_loss_fn,
+                        lr_sched=lr_sched,
+                        mix_transform=mix_transform,
+                        val_loader=val_loader,
+                        device=device,
+                        ctx=ctx,
+                        fl_kwargs=cfg['fed'],
+                        opt_kwargs=opt_kwargs,
+                        num_gpus=4,
+                        agg_fn=expert_weighted_fedavg)
+
+    va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+    print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

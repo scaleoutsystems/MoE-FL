@@ -124,10 +124,21 @@ def log_and_checkpoint(ctx,round_idx,metrics,
 
     return saved
     
-def load_checkpoint(ctx, global_model, ema_model, map_location="cpu"):
-    ckpt_path = ctx["ckpt_dir"] / "last.pt"
+def load_checkpoint(run_path, global_model, ema_model, map_location="cpu"):
+    run_path = Path(run_path)
+    ckpt_path = run_path / "checkpoints" / "last.pt"
+
+    ctx = {
+        "run_id": run_path.name,
+        "run_dir": run_path,
+        "ckpt_dir": run_path / "checkpoints",
+        "metrics_path": run_path / "metrics.jsonl",
+        "client_metrics_path": run_path / "client_metrics.jsonl",
+        "best": None,
+    }
+
     if not ckpt_path.exists():
-        return 0
+        raise FileNotFoundError()
 
     ckpt = torch.load(ckpt_path, map_location=map_location)
 
@@ -135,5 +146,10 @@ def load_checkpoint(ctx, global_model, ema_model, map_location="cpu"):
     if ema_model is not None and ckpt.get("ema_model") is not None:
         ema_model.load_state_dict(ckpt["ema_model"])
 
-    # resume at next round
-    return int(ckpt["round"]) + 1
+    best_ckpt_path = run_path / "checkpoints" / "best.pt"
+    if best_ckpt_path.exists():
+        best_ckpt = torch.load(best_ckpt_path, map_location=map_location)
+        ctx["best"] = best_ckpt.get("best_score")
+
+    start_round = int(ckpt["round"]) + 1
+    return start_round, ctx, global_model, ema_model

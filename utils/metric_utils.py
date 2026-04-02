@@ -65,7 +65,7 @@ def fedavg_comm_cost_mb(model, num_clients, num_rounds, bytes_per_param=4):
         "total_training_MB": to_mb(total_training),
     }
 
-def count_flops(model,inputs,show_table=False,max_depth=4,):
+def count_flops(model,inputs,show_table=False,max_depth=4):
     model.eval()
     with torch.no_grad():
         flops = FlopCountAnalysis(model, inputs)

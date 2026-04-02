@@ -71,10 +71,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = capacity_ratio
         self.num_experts = num_experts
-        #self.expert_stats = torch.zeros(self.num_experts)
         self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
 
-        self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
+        #self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
 
     #This module may not work well with torch.compile
     @torch.compiler.disable
@@ -88,9 +87,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         moe_flat = self.moe_route(x_flat, topi, weights, order)  # [T, C]
         
         if aux_loss is None:
-            self.aux_loss = x_flat.new_zeros(())
+           self.aux_loss = x_flat.new_zeros(())
         else:
-            self.aux_loss = aux_loss
+           self.aux_loss = aux_loss
             
         #Additional skip connection described in paper       
         x_skip = self.permute_back(x)
@@ -98,9 +97,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         moe_out = moe_flat.view(N, H, W, C)
         moe_out = self.permute_back(moe_out)  # (N, C, H, W)
 
-        moe_out = self.layer_scale * moe_out
+       # moe_out = self.layer_scale * moe_out
         
-        return input + x_skip + moe_out
+        return input + moe_out + x_skip 
     
 class ConvNeXtExpert(nn.Module):
     def __init__(self, dim, mlp_ratio):

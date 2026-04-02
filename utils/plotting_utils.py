@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 from matplotlib.offsetbox import AnchoredText
 import matplotlib.cm as cm
 import numpy as np
+import os
+import seaborn as sns
+from pathlib import Path
 
 def plot_training(jsonl_path: str) -> plt.Figure:
     rounds, val_acc, val_loss = [], [], []
@@ -42,11 +45,11 @@ def plot_training(jsonl_path: str) -> plt.Figure:
         ax.spines[["top", "right"]].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig("figs/run_2_global.png",dpi=800)
+    plt.savefig(os.path.join(os.path.dirname(jsonl_path), "global.png"),dpi=800)
     
-def plot_fl_client_training(log_path: str, metric: str = "acc", figsize=(10, 5)):
+def plot_fl_client_training(jsonl_path: str, metric: str = "acc", figsize=(10, 5)):
     records = []
-    with open(log_path) as f:
+    with open(jsonl_path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -79,8 +82,65 @@ def plot_fl_client_training(log_path: str, metric: str = "acc", figsize=(10, 5))
     ax.set_xticks(range(0, all_rounds[-1] + 1, 50))
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    plt.savefig("figs/run_2_clients.png", dpi=800)
+    plt.savefig(os.path.join(os.path.dirname(jsonl_path), "clients.png"),dpi=800)
 
+def plot_expert_activation_barplot(save_path, va, layer_name, moe_index):
+    save_path = Path(save_path)
+    stats = va["moe_stats"][layer_name]
+    data = np.array(stats["expert_activation_pct"].tolist())
+    n_experts = len(data)
 
-plot_training("imagenet_convnext_fl_20260316_144213/metrics.jsonl")
-plot_fl_client_training("imagenet_convnext_fl_20260316_144213/client_metrics.jsonl")
+    fig, ax = plt.subplots(figsize=(max(6, n_experts * 0.8), 4))
+    bars = ax.bar(
+        [f"E{i}" for i in range(n_experts)],
+        data,
+        color=sns.color_palette("Blues_d", n_experts),
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    # for bar, val in zip(bars, data):
+    #     ax.text(
+    #         bar.get_x() + bar.get_width() / 2,
+    #         bar.get_height() + 1.0,
+    #         f"{val:.1f}%",
+    #         ha="center", va="bottom", fontsize=9,
+    #     )
+    ax.set_title(f"Expert activation — MoE Layer {moe_index}", fontsize=13)
+    ax.set_xlabel("Expert")
+    ax.set_ylabel("Activation %")
+    #ax.set_ylim(0, 110)
+    #ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    ax.axhline(y=25, color="red", linestyle="--", linewidth=1.0)
+    sns.despine()
+    plt.tight_layout()
+    plt.savefig(save_path / f"expert_activation_moe_layer_{moe_index}.png", dpi=800)
+    plt.close()
+
+def plot_class_expert_heatmap(save_path, va, layer_name, moe_index):
+    save_path = Path(save_path)
+    stats = va["moe_stats"][layer_name]
+    data = np.array(stats["class_expert_activation_pct"].tolist()).T
+    n_experts, n_classes = data.shape
+
+    fig, ax = plt.subplots(figsize=(max(6, n_classes * 0.08), max(4, n_experts * 0.8)))
+    sns.heatmap(
+        data,
+        ax=ax,
+        annot=False,
+        fmt=".1f",
+        cmap="rocket",
+        linewidths=0.0,
+        #linecolor="white",
+        #xticklabels=[str(i) if i % 10 == 0 else "" for i in range(n_classes)],
+        xticklabels=[str(i) if i % 10 == 0 else "" for i in range(1, n_classes + 1)],
+        yticklabels=[f"E{i}" for i in range(n_experts)],
+        cbar_kws={"label": "Activation %"},
+    )
+    ax.set_title(f"Class and expert activation — MoE Layer {moe_index}", fontsize=13)
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Expert")
+    ax.tick_params(left=False, bottom=False)
+    plt.tight_layout()
+    plt.savefig(save_path / f"class_expert_activation_moe_layer_{moe_index}.png", dpi=800)
+    plt.close()

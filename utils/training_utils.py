@@ -3,11 +3,12 @@ import math
 import random
 import gc
 import ray
+import logging
 from copy import deepcopy
 from functools import partial
 from torch.amp import autocast, GradScaler
 from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
-from .experiment_tracking import log_and_checkpoint, log_client_metrics
+from .experiment_tracking import log_and_checkpoint, log_client_metrics, load_checkpoint
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
@@ -159,6 +160,7 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
     if moe_stats:
         result["moe_stats"] = {
             name: {
+                "tokens_kept":             tokens_kept[name],
                 "expert_activation_pct":       (tokens_kept[name] / (tokens_kept[name].sum() + 1e-9)) * 100,
                 "class_expert_activation_pct": (class_hits[name]  / (class_hits[name].sum(1, keepdim=True) + 1e-9)) * 100,
             }
@@ -175,12 +177,15 @@ class ClientWorker:
         self.model = torch.compile(model_fn().to(self.device))
         self.amp_dtype = amp_dtype
         self.scaler = GradScaler(device=self.device) if amp_dtype == torch.float16 else None
+        
+    def set_params(self, params):
+        #params arrives as a regular dict, Ray serializes it once via the call itself
+        self.model.load_state_dict({k: v.to(self.device) for k, v in params.items()})
 
-    def train(self, client, global_params, opt_fn, opt_kwargs, lr_r,
+    def train(self, client,  opt_fn, opt_kwargs, lr_r,
               train_loss_fn, local_epochs, mix_transform,
               fedprox, mu, snap_cpu, collect_expert_stats):
 
-        self.model.load_state_dict({k: v.to(self.device) for k, v in global_params.items()})
         optimizer = opt_fn(self.model, opt_kwargs)
         set_lr(optimizer, lr_r)
         snap = [p.to(self.device) for p in snap_cpu] if snap_cpu else None
@@ -189,7 +194,7 @@ class ClientWorker:
         hist = train_client(
             self.model, loader, self.device, optimizer,
             train_loss_fn, self.scaler, self.amp_dtype,
-            num_epochs=local_epochs, log=True,
+            num_epochs=local_epochs, log=False,
             mix_transform=mix_transform,
             fedprox=fedprox, mu=mu, snap=snap,
         )
@@ -204,6 +209,7 @@ class ClientWorker:
         if collect_expert_stats:
             result["moe_stats"] = self.model.pop_expert_stats()
 
+        torch.cuda.empty_cache()
         return result
     
 def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_kwargs,
@@ -212,21 +218,28 @@ def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_
 
     snap_cpu = [p.detach().cpu() for p in snap] if (fedprox and snap is not None) else None
     results = []
+    
+    global_ref = ray.put(global_params)
+    ray.get([w.set_params.remote(global_ref) for w in workers])
+    del global_ref
+    snap_ref = ray.put(snap_cpu)
 
     for batch_start in range(0, len(selected_clients), num_gpus):
         batch = selected_clients[batch_start : batch_start + num_gpus]
 
         futures = [
             workers[rank].train.remote(
-                client, global_params, opt_fn, opt_kwargs, lr_r,
+                client, opt_fn, opt_kwargs, lr_r,
                 train_loss_fn, local_epochs, mix_transform,
-                fedprox, mu, snap_cpu, collect_expert_stats
+                fedprox, mu, snap_ref, collect_expert_stats
             )
             for rank, client in enumerate(batch)
         ]
 
         batch_results = ray.get(futures)
         results.extend(batch_results)
+    
+    del snap_ref
 
     return results
 
@@ -327,7 +340,8 @@ def fl_loop(clients,model_fn,opt_fn,
             ctx,fl_kwargs,opt_kwargs,
             eval_every=1, agg_fn=fedavg,
             amp_dtype=torch.bfloat16, 
-            num_gpus=1, io_bottleneck=False):
+            num_gpus=1, io_bottleneck=False,
+            ckpt_path=None):
     
     client_frac = fl_kwargs['client_frac']
     num_clients = fl_kwargs['num_clients']
@@ -336,7 +350,15 @@ def fl_loop(clients,model_fn,opt_fn,
     fedprox = fl_kwargs['fedprox']
     mu = fl_kwargs['mu']
     
-    global_model = torch.compile(model_fn().to(device))
+    global_model = model_fn()
+    
+    if ckpt_path is not None:
+       start_round, ctx, global_model, _ = load_checkpoint(ckpt_path,global_model,None)
+       global_model = torch.compile(global_model).to(device)
+    else:
+        start_round = 0
+        global_model = torch.compile(global_model).to(device)
+    
     if num_gpus == 1:
         local_model = torch.compile(model_fn().to(device))
     else:
@@ -351,14 +373,14 @@ def fl_loop(clients,model_fn,opt_fn,
         scaler = None
         
     if num_gpus > 1:
-        ray.init()
+        ray.init(include_dashboard=False,logging_level=logging.ERROR)
         workers = [ClientWorker.remote(model_fn, amp_dtype) for _ in range(num_gpus)]
-        print(f"Started {num_gpus} persistent Ray workers", flush=True)
+        print(f"Started {num_gpus} persistent Ray workers")
     else:
         workers = None
 
     # Federated loop
-    for r in range(num_rounds):
+    for r in range(start_round, num_rounds):
         print(f"\n=== Round {r} ===")
         
         lr_r = float(lr_sched[r])

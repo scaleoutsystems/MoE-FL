@@ -177,12 +177,12 @@ if __name__ == "__main__":
     ctx = init_run("imagenet_convnext_moe_fl", cfg)
     print("Run dir:", ctx["run_dir"])
 
-    print("Loading data...")
+    print("Loading data...") 
     train = ImageNetSubset(root='data',split='train', transform=train_transform)
     val = ImageNetSubset(root='data',split='val', transform=val_transform)
 
     #Global eval loaders 
-    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
+    val_loader = DataLoader(val, batch_size=256, shuffle=False,persistent_workers=True, **val_dl_kwargs)
     print("Data loaded")
 
     # Client loaders 

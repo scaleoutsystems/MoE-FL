@@ -2,7 +2,9 @@ import torch
 import threading
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
+from .data_utils import WeatherImageNetSubset
 import ctypes
+from collections import defaultdict
 
 #We have to force free the RAM
 def release_memory():
@@ -246,12 +248,31 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True):
     n = len(dataset)
     indices = np.arange(n)
+    
+    if isinstance(dataset, WeatherImageNetSubset):
+        clients_per_weather = num_clients // len(dataset.weather_types)
 
-    if shuffle:
-        rng = np.random.default_rng(seed)
-        rng.shuffle(indices)
+        splits = []
+        for weather in dataset.weather_types:
+            class_indices = defaultdict(list)
+            for i, (w, t) in enumerate(zip(dataset.weathers, dataset.targets)):
+                if w == weather:
+                    class_indices[t].append(i)
 
-    splits = np.array_split(indices, num_clients)
+            client_index_lists = [[] for _ in range(clients_per_weather)]
+            for label_indices in class_indices.values():
+                if shuffle:
+                    rng.shuffle(label_indices)
+                for cid, chunk in enumerate(np.array_split(label_indices, clients_per_weather)):
+                    client_index_lists[cid].extend(chunk.tolist())
+
+            splits.extend(client_index_lists)
+    else:
+        if shuffle:
+            rng = np.random.default_rng(seed)
+            rng.shuffle(indices)
+
+        splits = np.array_split(indices, num_clients)
 
     clients = []
     for cid, idxs in enumerate(splits):

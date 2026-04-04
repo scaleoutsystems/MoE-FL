@@ -3,6 +3,7 @@ import math
 import random
 import gc
 import ray
+import time
 import logging
 from copy import deepcopy
 from functools import partial
@@ -382,6 +383,15 @@ def fl_loop(clients,model_fn,opt_fn,
     # Federated loop
     for r in range(start_round, num_rounds):
         print(f"\n=== Round {r} ===")
+        
+        #Restart ray every 100 rounds to avoid performance drift
+        if (r != 0) and (r % 100 == 0) and num_gpus > 1:
+            print("Restarting ray")
+            ray.shutdown()
+            time.sleep(1)
+            ray.init(include_dashboard=False,logging_level=logging.ERROR)
+            workers = [ClientWorker.remote(model_fn, amp_dtype) for _ in range(num_gpus)]
+            print(f"Started {num_gpus} persistent Ray workers")
         
         lr_r = float(lr_sched[r])
         m = int(max(1, math.ceil(client_frac * num_clients)))

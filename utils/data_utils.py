@@ -1,6 +1,6 @@
+import os
 from torchvision.datasets import ImageNet
 from torch.utils.data import Subset
-
 
 SUBSET_CLASSES = [
     # Animals
@@ -28,6 +28,7 @@ SUBSET_CLASSES = [
     "flagpole", "fountain", "mailbox", "park bench", "parking meter",
     "picket fence", "solar dish", "sundial", "traffic light", "street sign",
 ]
+
     
 class ImageNetSubset(ImageNet):
     """ImageNet filtered to a 100-class outdoor subset, with labels remapped to 0-99."""
@@ -58,3 +59,24 @@ class ImageNetSubset(ImageNet):
     def __getitem__(self, idx):
         img, label = super().__getitem__(idx)
         return img, self.label_map[label]
+    
+    
+class WeatherImageNetSubset(ImageNetSubset):
+    def __init__(self, root, split="train", transform=None):
+        super().__init__(root=root, split=split, transform=transform)
+        #The available weather augmentations
+        self.weather_types = ["sunny", "fog", "rain", "snow"]
+        #The weather labels for each data point
+        self.weathers = [self._parse_weather(p) for p, _ in self.imgs]
+
+    def _parse_weather(self, path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        parts = stem.rsplit("_", maxsplit=1)
+        return parts[1]
+
+    def get_weather_subset(self, weather: str) -> Subset:
+        indices = [i for i, w in enumerate(self.weathers) if w == weather]
+        return Subset(self, indices)
+
+    def get_all_weather_subsets(self) -> dict[str, Subset]:
+        return {w: self.get_weather_subset(w) for w in self.WEATHERS}

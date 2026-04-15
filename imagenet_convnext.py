@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-#from torchvision.datasets import ImageNet
 from torchvision.models import convnext_tiny
 from torchvision import transforms
 
@@ -22,14 +21,15 @@ print("Running on:", device)
 
 seed=42
 num_clients = 20
-num_rounds = 600
+num_rounds = 500
 local_epochs = 5
-client_frac = 0.2
+client_frac = 0.4
 
 batch_size = 64
-base_lr = 0.025
-start_lr = 0.005
-warmup_rounds = 30
+base_lr = 0.04
+start_lr = 0.004
+end_lr = 1e-6
+warmup_rounds = num_rounds * 0.1
 
 label_smoothing = 0.1
 
@@ -53,7 +53,7 @@ interpolation = "bicubic"
 opt_kwargs = {
     "lr": base_lr,
     "momentum": 0.9,
-    "weight_decay": 3e-4,
+    "weight_decay": 0.0,
     "nesterov": True,
 }
 
@@ -69,6 +69,7 @@ val_dl_kwargs = {**dl_kwargs, "drop_last": False}
 cfg = {
     "seed": seed,
     "fed": {
+        "agg": "fedavg",
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "client_frac": client_frac,
@@ -80,6 +81,7 @@ cfg = {
         "sched" : "lin_warmup_cosine_annealing",
         "base_lr": base_lr,
         "start_lr": start_lr,
+        "end_lr": end_lr,
         "warmup_rounds": warmup_rounds,
         "kwargs": opt_kwargs,
     },
@@ -101,6 +103,7 @@ cfg = {
             "random_erase_mode": rand_erase_mode,
         },
         "interpolation": interpolation,
+        "color_jitter": color_jitter,
     },
     "reg": {
         "label_smoothing": label_smoothing,
@@ -146,32 +149,6 @@ mix_transform = Mixup(
     num_classes=100, 
 )
 
-ctx = init_run("imagenet_convnext_fl", cfg)
-print("Run dir:", ctx["run_dir"])
-
-print("Loading data...")
-
-#Train transform is handled by init_clients
-train = ImageNetSubset(root='data', split='train', transform=train_transform)
-val = ImageNetSubset(root='data',split='val', transform=val_transform)
-
-#Global eval loader
-val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
-print("Data loaded")
-
-clients = init_clients(
-    dataset=train,
-    num_clients=num_clients,
-    batch_size=batch_size,
-    dl_kwargs=dl_kwargs,
-    transform=train_transform,
-    seed=seed,
-    shuffle=True,
-)
-        
-lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
-                       total_rounds=num_rounds, start_lr=start_lr)
-
 if mix_transform is not None:
     train_loss_fn = SoftTargetCrossEntropy()
 else:
@@ -184,18 +161,45 @@ def opt_fn(model, opt_kwargs):
 def model_fn():
     return convnext_tiny(weights=None,num_classes=100)
 
-global_model = fl_loop(clients=clients, 
-                       model_fn=model_fn,
-                       opt_fn = opt_fn,
-                       train_loss_fn=train_loss_fn,
-                       eval_loss_fn=eval_loss_fn,
-                       lr_sched=lr_sched,
-                       mix_transform=mix_transform,
-                       val_loader=val_loader,
-                       device=device,
-                       ctx=ctx,
-                       fl_kwargs=cfg['fed'],
-                       opt_kwargs=opt_kwargs)
+if __name__ == "__main__":
+    ctx = init_run("imagenet_convnext_fl", cfg)
+    print("Run dir:", ctx["run_dir"])
 
-va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+    print("Loading data...")
+
+    #Train transform is handled by init_clients
+    train = ImageNetSubset(root='data', split='train', transform=train_transform)
+    val = ImageNetSubset(root='data',split='val', transform=val_transform)
+
+    #Global eval loader
+    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
+    print("Data loaded")
+
+    clients = init_clients(
+        dataset=train,
+        num_clients=num_clients,
+        batch_size=batch_size,
+        dl_kwargs=dl_kwargs,
+        transform=train_transform,
+        seed=seed,
+        shuffle=True,
+    )
+            
+    lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
+                        total_rounds=num_rounds, start_lr=start_lr)
+
+    global_model = fl_loop(clients=clients, 
+                        model_fn=model_fn,
+                        opt_fn = opt_fn,
+                        train_loss_fn=train_loss_fn,
+                        eval_loss_fn=eval_loss_fn,
+                        lr_sched=lr_sched,
+                        mix_transform=mix_transform,
+                        val_loader=val_loader,
+                        device=device,
+                        ctx=ctx,
+                        fl_kwargs=cfg['fed'],
+                        opt_kwargs=opt_kwargs)
+
+    va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+    print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

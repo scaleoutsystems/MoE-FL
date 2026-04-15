@@ -50,7 +50,6 @@ def fedavg(client_states, client_num_samples, device="cpu"):
 
     return agg
 
-
 def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
     
     device = torch.device(device)
@@ -248,6 +247,7 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True):
     n = len(dataset)
     indices = np.arange(n)
+    rng = np.random.default_rng(seed)
     
     if isinstance(dataset, WeatherImageNetSubset):
         clients_per_weather = num_clients // len(dataset.weather_types)
@@ -269,11 +269,9 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
             splits.extend(client_index_lists)
     else:
         if shuffle:
-            rng = np.random.default_rng(seed)
             rng.shuffle(indices)
 
         splits = np.array_split(indices, num_clients)
-
     clients = []
     for cid, idxs in enumerate(splits):
         clients.append(Client(

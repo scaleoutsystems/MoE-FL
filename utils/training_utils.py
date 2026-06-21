@@ -5,11 +5,169 @@ import gc
 import ray
 import time
 import logging
+import numpy as np
 from copy import deepcopy
 from functools import partial
+from collections import defaultdict
 from torch.amp import autocast, GradScaler
-from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg
-from .experiment_tracking import log_and_checkpoint, log_client_metrics, load_checkpoint
+from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg, fedadam, expert_weighted_fedadam, expert_weighted_fedavg
+from .experiment_tracking import log_and_checkpoint, log_client_metrics, load_checkpoint, log_routing_metrics
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
+                          loss_fn, eval_loss_fn, scheduler_fn,
+                          mix_transform, ctx, opt_kwargs,
+                          num_epochs=300, eval_every=5,
+                          amp_dtype=torch.bfloat16, ckpt_path=None,
+                          batch_size=512, num_workers=4):
+
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    device     = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    is_master  = rank == 0
+
+    train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    train_loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
+                                                sampler=train_sampler,
+                                                num_workers=num_workers,
+                                                pin_memory=True)
+    val_loader    = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size,
+                                                sampler=val_sampler,
+                                                num_workers=num_workers,
+                                                pin_memory=True)
+
+    model   = torch.compile(model_fn().to(device))
+    model   = DDP(model, device_ids=[rank])
+    scaler  = GradScaler(device=device) if amp_dtype == torch.float16 else None
+    has_aux = hasattr(model.module, "get_aux_loss")
+    collect_expert_stats = getattr(model.module, "collect_expert_stats", False)
+
+    optimizer = opt_fn(model, opt_kwargs)
+    scheduler = scheduler_fn(optimizer)
+
+    if ckpt_path is not None:
+        start_epoch, ctx, model, _, optimizer = load_checkpoint(ckpt_path, model, None, optimizer)
+        scheduler = scheduler_fn(optimizer)
+        for _ in range(start_epoch):
+            scheduler.step()
+    else:
+        start_epoch = 0
+
+    for epoch in range(start_epoch, num_epochs):
+        train_sampler.set_epoch(epoch)
+
+        if is_master:
+            print(f"\n=== Epoch {epoch} ===")
+        model.train()
+
+        running_base  = torch.zeros((), device=device)
+        running_aux   = torch.zeros((), device=device)
+        running_total = torch.zeros((), device=device)
+        correct = torch.zeros((), device=device, dtype=torch.long)
+        total   = torch.zeros((), device=device, dtype=torch.long)
+
+        for x, y in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            if mix_transform is not None:
+                x, y = mix_transform(x, y)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                if has_aux:
+                    logits, aux = model(x, return_aux=True)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss + aux
+                else:
+                    logits = model(x)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss
+
+            if scaler is None:
+                total_loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+            bs = x.size(0)
+            running_total += total_loss.detach() * bs
+            running_base  += base_loss.detach() * bs
+            if has_aux:
+                running_aux += aux.detach() * bs
+            y_hard = y.argmax(dim=1) if y.ndim == 2 else y
+            correct += (logits.argmax(dim=1) == y_hard).sum()
+            total   += bs
+
+        scheduler.step()
+        lr = scheduler.get_last_lr()[0]
+
+        for t in [running_total, running_base, running_aux, correct, total]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+        if is_master:
+            epoch_total = (running_total / total).item()
+            epoch_acc   = (correct / total).item()
+            epoch_base  = (running_base / total).item()
+            epoch_aux   = (running_aux / total).item() if has_aux else None
+
+            parts = [f"Epoch [{epoch+1}/{num_epochs}]"]
+            if has_aux:
+                parts.append(f"base loss: {epoch_base:.4f}")
+                parts.append(f"aux loss: {epoch_aux:.6f}")
+            parts.append(f"total loss: {epoch_total:.4f}")
+            parts.append(f"acc: {epoch_acc:.4f}")
+            parts.append(f"lr: {lr:.6f}")
+            print(" - ".join(parts))
+
+        if (epoch % eval_every) == 0 or (epoch == num_epochs - 1):
+            va = evaluate(model.module, val_loader, device, loss_fn=eval_loss_fn)
+
+            val_loss_t = torch.tensor(va["loss"], device=device)
+            val_acc_t  = torch.tensor(va["acc"],  device=device)
+            dist.all_reduce(val_loss_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_acc_t,  op=dist.ReduceOp.SUM)
+            val_loss = (val_loss_t / world_size).item()
+            val_acc  = (val_acc_t  / world_size).item()
+
+            # if is_master:
+            #     print(f"[Eval] val loss {val_loss:.4f} acc {val_acc:.4f}")
+            #     metrics = {"lr": lr, "val_loss": val_loss, "val_acc": val_acc}
+            #     saved = log_and_checkpoint(
+            #         ctx, epoch, metrics, model.module,
+            #         ema_model=None, best_key="val_acc", mode="max",
+            #         server_optimizer=optimizer,
+            #     )
+            #     if saved:
+            #         print(f"New best at epoch {epoch}: {val_acc:.4f}")
+            if is_master:
+                print(f"[Eval] val loss {val_loss:.4f} acc {val_acc:.4f}")
+                metrics = {"lr": lr, "val_loss": val_loss, "val_acc": val_acc}
+
+                if collect_expert_stats and "moe_stats" in va:
+                    for name, stats in va["moe_stats"].items():
+                        metrics[f"expert_activation_pct/{name}"] = stats["expert_activation_pct"].tolist()
+
+                saved = log_and_checkpoint(
+                    ctx, epoch, metrics, model.module,
+                    ema_model=None, best_key="val_acc", mode="max",
+                    server_optimizer=optimizer,
+                )
+                if saved:
+                    print(f"New best at epoch {epoch}: {val_acc:.4f}")
+
+            dist.barrier()
+
+    dist.destroy_process_group()
+    return model.module
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
@@ -117,7 +275,7 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
             print(" - ".join(parts))
 
     return history
-    
+
 @torch.no_grad()
 def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
     model.eval()
@@ -129,8 +287,9 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
     if moe_stats:
         E = model._moe_modules[0].num_experts
         layer_names = [n for n, m in model.base.named_modules() if m in model._moe_modules]
-        tokens_kept = {n: torch.zeros(E, dtype=torch.long) for n in layer_names}
-        class_hits  = {n: torch.zeros(num_classes, E, dtype=torch.long) for n in layer_names}
+        tokens_kept  = {n: torch.zeros(E, dtype=torch.long) for n in layer_names}
+        class_hits   = {n: torch.zeros(num_classes, E, dtype=torch.long) for n in layer_names}
+        spatial_hits = {n: torch.zeros(E, dtype=torch.long) for n in layer_names}
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -148,10 +307,20 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
             labels_cpu = y.cpu()
             for name, m in ((n, mo) for n, mo in model.base.named_modules() if mo in model._moe_modules):
                 expert_id, token_idx, T = m._last_routing
-                image_idx = token_idx // (T // labels_cpu.shape[0])
+                patches_per_image = T // labels_cpu.shape[0]
+                image_idx = token_idx // patches_per_image
+                spatial_pos = token_idx % patches_per_image
+
                 tokens_kept[name].scatter_add_(0, expert_id, torch.ones_like(expert_id))
+
                 idx = labels_cpu[image_idx] * E + expert_id
                 class_hits[name].view(-1).scatter_add_(0, idx, torch.ones_like(idx))
+
+                # Initialise spatial_hits once we know the number of patches
+                if spatial_hits[name].shape[-1] == 1 or spatial_hits[name].shape[-1] != patches_per_image:
+                    spatial_hits[name] = torch.zeros(E, patches_per_image, dtype=torch.long)
+                idx_spatial = expert_id * patches_per_image + spatial_pos
+                spatial_hits[name].view(-1).scatter_add_(0, idx_spatial, torch.ones_like(idx_spatial))
 
     result = {
         "loss": (total_loss / total_samples).item(),
@@ -161,23 +330,85 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
     if moe_stats:
         result["moe_stats"] = {
             name: {
-                "tokens_kept":             tokens_kept[name],
-                "expert_activation_pct":       (tokens_kept[name] / (tokens_kept[name].sum() + 1e-9)) * 100,
-                "class_expert_activation_pct": (class_hits[name]  / (class_hits[name].sum(1, keepdim=True) + 1e-9)) * 100,
+                "tokens_kept":                 tokens_kept[name],
+                "expert_activation_pct":       (tokens_kept[name] / (tokens_kept[name].sum() + 1e-9)),
+                "class_expert_activation_pct": (class_hits[name]  / (class_hits[name].sum(1, keepdim=True) + 1e-9)),
+                "spatial_expert_activation":   spatial_hits[name],
             }
             for name in layer_names
         }
         
     return result
 
+@torch.no_grad()
+def compute_routing_metrics(round_idx, routing_model, global_params,
+                             client_states, selected_clients,
+                             val_loader, device):
+
+    def capture(model):
+        routing_records = defaultdict(list)
+        hooks = []
+
+        def make_hook(name):
+            def hook(module, input, output):
+                logits = output.detach()
+                if logits.dim() == 4:
+                    logits = logits.flatten(0, 2)
+                routing_records[name].append(logits.argmax(dim=-1).cpu())
+            return hook
+
+        for name, module in model.named_modules():
+            if "router" in name and "gate" in name and isinstance(module, torch.nn.Linear):
+                hooks.append(module.register_forward_hook(make_hook(name)))
+
+        model.eval()
+        for x, _ in val_loader:
+            model(x.to(device))
+
+        for h in hooks:
+            h.remove()
+
+        assignments = {k: torch.cat(v) for k, v in routing_records.items()}
+        load_balance = {}
+        for gate, tokens in assignments.items():
+            counts = torch.bincount(tokens, minlength=4).float()
+            load_balance[gate] = (counts / counts.sum()).tolist()
+
+        return assignments, load_balance
+
+    routing_model.load_state_dict(global_params)
+    global_routing, global_load_balance = capture(routing_model)
+
+    per_client_agreement = {}
+    for client, state in zip(selected_clients, client_states):
+        routing_model.load_state_dict(state)
+        cr, _ = capture(routing_model)
+        gate_agreements = [
+            (cr[gate] == global_routing[gate]).float().mean().item()
+            for gate in global_routing
+        ]
+        per_client_agreement[str(client.cid)] = float(torch.tensor(gate_agreements).mean())
+
+    routing_model.load_state_dict(global_params)
+
+    return {
+        "round": round_idx,
+        "mean_routing_agreement": float(torch.tensor(list(per_client_agreement.values())).mean()),
+        "client_routing_agreement": per_client_agreement,
+        "global_load_balance": global_load_balance,
+    }
 
 @ray.remote(num_gpus=1)
 class ClientWorker:
-    def __init__(self, model_fn, amp_dtype):
+    def __init__(self, model_fn, amp_dtype,seed=42):
         self.device = torch.device("cuda:0")  # Ray assigns 1 GPU per actor
         self.model = torch.compile(model_fn().to(self.device))
         self.amp_dtype = amp_dtype
         self.scaler = GradScaler(device=self.device) if amp_dtype == torch.float16 else None
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         
     def set_params(self, params):
         #params arrives as a regular dict, Ray serializes it once via the call itself
@@ -339,7 +570,7 @@ def fl_loop(clients,model_fn,opt_fn,
             lr_sched,mix_transform,
             val_loader,device,
             ctx,fl_kwargs,opt_kwargs,
-            eval_every=1, agg_fn=fedavg,
+            eval_every=5, agg_fn=fedavg,
             amp_dtype=torch.bfloat16, 
             num_gpus=1, io_bottleneck=False,
             ckpt_path=None):
@@ -352,10 +583,26 @@ def fl_loop(clients,model_fn,opt_fn,
     mu = fl_kwargs['mu']
     
     global_model = model_fn()
+    routing_model = None
+    
+    if agg_fn is fedadam or agg_fn is expert_weighted_fedadam:
+        server_optimizer = torch.optim.Adam(
+            global_model.parameters(),
+            lr=fl_kwargs['server_lr'],
+            betas=fl_kwargs['server_betas'],
+            eps=fl_kwargs['server_eps'],
+        )
+    else:
+        server_optimizer = None
     
     if ckpt_path is not None:
-       start_round, ctx, global_model, _ = load_checkpoint(ckpt_path,global_model,None)
-       global_model = torch.compile(global_model).to(device)
+        start_round, ctx, global_model, _, server_optimizer = load_checkpoint(ckpt_path,global_model,None,server_optimizer)
+        global_model = torch.compile(global_model).to(device)
+        if server_optimizer is not None:
+            for state in server_optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
     else:
         start_round = 0
         global_model = torch.compile(global_model).to(device)
@@ -427,10 +674,17 @@ def fl_loop(clients,model_fn,opt_fn,
         client_ns     = [r["num_samples"] for r in results]
         client_metrics = [{"cid": r["cid"], "num_samples": r["num_samples"],
                            "history": r["history"]} for r in results]
-
-        if collect_expert_stats:
+        
+        if agg_fn is expert_weighted_fedadam:
+            client_expert_stats = [r["moe_stats"] for r in results]
+            round_agg_fn = partial(agg_fn,global_model=global_model,
+                                   server_optimizer=server_optimizer,
+                                   moe_stats=client_expert_stats)
+        elif agg_fn is expert_weighted_fedavg:
             client_expert_stats = [r["moe_stats"] for r in results]
             round_agg_fn = partial(agg_fn, moe_stats=client_expert_stats) 
+        elif agg_fn is fedadam:
+            round_agg_fn = partial(agg_fn,global_model=global_model,server_optimizer=server_optimizer)
         else:
             round_agg_fn = agg_fn
 
@@ -450,12 +704,27 @@ def fl_loop(clients,model_fn,opt_fn,
                 "val_loss": float(va["loss"]),
                 "val_acc": float(va["acc"]),
             }
-
-            saved = log_and_checkpoint(ctx,r,metrics,global_model, 
-                                    ema_model=None, best_key="val_acc", mode="max",)
+            
+            saved = log_and_checkpoint(ctx,r,metrics,global_model,
+                           ema_model=None, best_key="val_acc", mode="max",
+                           server_optimizer=server_optimizer)
 
             if saved:
                 print(f"New best at round {r}: {metrics['val_acc']:.4f}")
+        # Routing analysis 
+        if collect_expert_stats and (r % (eval_every * 2) == 0 or (r == num_rounds - 1)):
+            if routing_model is None:
+                routing_model = torch.compile(model_fn().to(device))
+            routing_metrics = compute_routing_metrics(
+                round_idx=r,
+                routing_model=routing_model,
+                global_params=global_params,
+                client_states=client_states,
+                selected_clients=selected_clients,
+                val_loader=val_loader,
+                device=device,
+            )
+            log_routing_metrics(ctx, routing_metrics)
                 
     if num_gpus > 1:
         ray.shutdown()

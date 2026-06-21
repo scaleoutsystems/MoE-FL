@@ -63,21 +63,22 @@ def get_uncompiled_state_dict(model):
     m = getattr(model, "_orig_mod", model)  #unwrap if compiled, no-op if not
     return m.state_dict()
 
-def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None):
+
+def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None, server_optimizer=None):
     payload = {
         "round": int(round_idx),
         "global_model": get_uncompiled_state_dict(global_model),
         "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None,
         "metrics": metrics or {},
+        "server_optimizer": server_optimizer.state_dict() if server_optimizer is not None else None,
     }
 
     ckpt_path = ctx["ckpt_dir"] / "last.pt"
     tmp_path = ckpt_path.with_suffix(".tmp")
     torch.save(payload, tmp_path)
     os.replace(tmp_path, ckpt_path)
-    
-    
-def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics=None, mode="max"):
+
+def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics=None, mode="max", server_optimizer=None):
     if mode not in ("max", "min"):
         raise ValueError("mode must be 'max' or 'min'")
 
@@ -94,8 +95,9 @@ def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics
         "round": int(round_idx),
         "best_score": score,
         "global_model": get_uncompiled_state_dict(global_model),
-        "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None, 
+        "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None,
         "metrics": metrics or {},
+        "server_optimizer": server_optimizer.state_dict() if server_optimizer is not None else None,
     }
 
     ckpt_path = ctx["ckpt_dir"] / "best.pt"
@@ -104,12 +106,10 @@ def save_best_checkpoint(ctx, round_idx, score, global_model, ema_model, metrics
     os.replace(tmp_path, ckpt_path)
     return True
 
-def log_and_checkpoint(ctx,round_idx,metrics,
-                       global_model,ema_model,
-                       best_key="val_acc",mode="max",):
-
-    log_metrics(ctx, round_idx,  metrics)
-    save_checkpoint(ctx, round_idx, global_model, ema_model, metrics)
+def log_and_checkpoint(ctx, round_idx, metrics, global_model, ema_model,
+                       best_key="val_acc", mode="max", server_optimizer=None):
+    log_metrics(ctx, round_idx, metrics)
+    save_checkpoint(ctx, round_idx, global_model, ema_model, metrics, server_optimizer)
 
     score = metrics[best_key]
     saved = save_best_checkpoint(
@@ -120,11 +120,12 @@ def log_and_checkpoint(ctx,round_idx,metrics,
         ema_model=ema_model,
         metrics=metrics,
         mode=mode,
+        server_optimizer=server_optimizer,
     )
 
-    return saved
-    
-def load_checkpoint(run_path, global_model, ema_model, map_location="cpu"):
+    return saved   
+
+def load_checkpoint(run_path, global_model, ema_model, server_optimizer=None, map_location="cpu"):
     run_path = Path(run_path)
     ckpt_path = run_path / "checkpoints" / "last.pt"
 
@@ -145,6 +146,8 @@ def load_checkpoint(run_path, global_model, ema_model, map_location="cpu"):
     global_model.load_state_dict(ckpt["global_model"])
     if ema_model is not None and ckpt.get("ema_model") is not None:
         ema_model.load_state_dict(ckpt["ema_model"])
+    if server_optimizer is not None and ckpt.get("server_optimizer") is not None:
+        server_optimizer.load_state_dict(ckpt["server_optimizer"])
 
     best_ckpt_path = run_path / "checkpoints" / "best.pt"
     if best_ckpt_path.exists():
@@ -152,4 +155,9 @@ def load_checkpoint(run_path, global_model, ema_model, map_location="cpu"):
         ctx["best"] = best_ckpt.get("best_score")
 
     start_round = int(ckpt["round"]) + 1
-    return start_round, ctx, global_model, ema_model
+    return start_round, ctx, global_model, ema_model, server_optimizer
+
+def log_routing_metrics(ctx, metrics):
+    routing_log_path = ctx["run_dir"] / "routing_metrics.jsonl"
+    with open(routing_log_path, "a") as f:
+        f.write(json.dumps(metrics) + "\n")

@@ -50,6 +50,30 @@ def fedavg(client_states, client_num_samples, device="cpu"):
 
     return agg
 
+def fedadam(client_states, client_ns, device, global_model, server_optimizer):
+    #Aggregate 
+    aggregated = fedavg(client_states, client_ns, device=device)
+    
+    #Compute pseudo-gradient and apply Adam
+    server_optimizer.zero_grad()
+    for name, param in global_model.named_parameters():
+        param.grad = (param.data - aggregated[name].to(param.device))
+    server_optimizer.step()
+    
+    return global_model.state_dict()
+
+def expert_weighted_fedadam(client_states, client_ns, moe_stats, device, global_model, server_optimizer):
+    #Aggregate 
+    aggregated = expert_weighted_fedavg(client_states, client_ns, moe_stats, device=device)
+    
+    #Compute pseudo-gradient and apply Adam
+    server_optimizer.zero_grad()
+    for name, param in global_model.named_parameters():
+        param.grad = (param.data - aggregated[name].to(param.device))
+    server_optimizer.step()
+    
+    return global_model.state_dict()
+
 def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
     
     device = torch.device(device)
@@ -101,6 +125,84 @@ def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device=
         
     return agg
 
+def gating_entropy_expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
+    device = torch.device(device)
+    eps = 1e-8
+
+    total = float(sum(client_num_samples))
+    weights = torch.tensor([n / total for n in client_num_samples], dtype=torch.float32)
+
+    # Normalize raw token counts into routing distributions
+    expert_weights = torch.stack([torch.stack(cs) for cs in moe_stats])
+    expert_weights = expert_weights / (expert_weights.sum(dim=-1, keepdim=True) + eps)
+    # (num_clients, num_layers, num_experts)
+
+    # Per-layer entropy weights for gating network
+    per_client_per_layer_entropy = -(expert_weights * torch.log(expert_weights + eps)).sum(dim=-1)
+    # (num_clients, num_layers)
+
+    # Combine with dataset size
+    raw_gate_weights = per_client_per_layer_entropy * weights.unsqueeze(-1)
+    gate_weights_per_layer = raw_gate_weights / (raw_gate_weights.sum(dim=0, keepdim=True) + eps)
+
+    # Utilization weights for expert parameters
+    combined_weights = expert_weights * weights.view(-1, 1, 1)
+    combined_weights = combined_weights / (combined_weights.sum(dim=0, keepdim=True) + eps)
+
+    # Build layer index mapping for expert parameter keys
+    layer_order = []
+    for k in client_states[0].keys():
+        parts = k.split(".")
+        if "experts" in parts:
+            ei = parts.index("experts")
+            layer_id = f"{parts[ei-2]}.{parts[ei-1]}"
+            if layer_id not in layer_order:
+                layer_order.append(layer_id)
+    layer_to_idx = {l: i for i, l in enumerate(layer_order)}
+
+    expert_key_info = {}
+    for k in client_states[0].keys():
+        parts = k.split(".")
+        if "experts" in parts:
+            ei = parts.index("experts")
+            layer_id = f"{parts[ei-2]}.{parts[ei-1]}"
+            expert_key_info[k] = (layer_to_idx[layer_id], int(parts[ei + 1]))
+        
+    gate_key_info = {}
+    for k in client_states[0].keys():
+        parts = k.split(".")
+        if "gate" in parts or "router" in parts:
+            gi = parts.index("gate") if "gate" in parts else parts.index("router")
+            gate_key_info[k] = int(parts[gi - 1])
+
+    # Aggregate
+    agg = {}
+    for k, t0 in client_states[0].items():
+        acc = torch.zeros_like(t0, device=device, dtype=torch.float32)
+
+        if k in expert_key_info:
+            # Expert parameter: weight by dataset size and utilization
+            layer_idx, expert_idx = expert_key_info[k]
+            for client_idx, sd in enumerate(client_states):
+                w = combined_weights[client_idx, layer_idx, expert_idx].item()
+                acc.add_(sd[k].to(device=device, dtype=torch.float32), alpha=w)
+
+        elif k in gate_key_info:
+            # Gating/router parameter: weight by dataset size and per-layer routing entropy
+            layer_idx = gate_key_info[k]
+            for client_idx, sd in enumerate(client_states):
+                w = gate_weights_per_layer[client_idx, layer_idx].item()
+                acc.add_(sd[k].to(device=device, dtype=torch.float32), alpha=w)
+
+        else:
+            # All other parameters: standard dataset-size weighted FedAvg
+            for w, sd in zip(weights, client_states):
+                acc.add_(sd[k].to(device=device, dtype=torch.float32), alpha=w.item())
+
+        agg[k] = acc.to(dtype=t0.dtype)
+
+    return agg
+
 @torch.no_grad()
 def snapshot_params_fp32(model, device):
     return [p.detach().float().clone().to(device) for p in model.parameters() if p.requires_grad]
@@ -129,7 +231,7 @@ def ema_update_model(ema_model, model, decay):
         else:
             ema_v.copy_(v)
 
-def lr_schedule(base_lr, start_lr, warmup_rounds, total_rounds, end_lr=0.0):
+def lr_schedule(base_lr, start_lr, warmup_rounds, total_rounds, end_lr=1e-6):
     r = np.arange(total_rounds + 1, dtype=np.float32)
     lrs = np.zeros_like(r)
 
@@ -243,12 +345,13 @@ class Client:
     def free(self):
         self._samples = None
 
+
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
-                 seed=42, shuffle=True):
+                 seed=42, shuffle=True, dirichlet_alpha=None):
     n = len(dataset)
     indices = np.arange(n)
     rng = np.random.default_rng(seed)
-    
+
     if isinstance(dataset, WeatherImageNetSubset):
         clients_per_weather = num_clients // len(dataset.weather_types)
 
@@ -267,11 +370,36 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                     client_index_lists[cid].extend(chunk.tolist())
 
             splits.extend(client_index_lists)
+
+    elif dirichlet_alpha is not None:
+        # Group indices by class label
+        targets = np.array(dataset.targets)
+        class_indices = defaultdict(list)
+        for idx in indices:
+            class_indices[targets[idx]].append(idx)
+
+        client_index_lists = [[] for _ in range(num_clients)]
+        for label_indices in class_indices.values():
+            label_indices = np.array(label_indices)
+            if shuffle:
+                rng.shuffle(label_indices)
+
+            # Sample proportions from Dirichlet distribution, then assign
+            # slices of each class's indices proportionally to each client
+            proportions = rng.dirichlet(np.full(num_clients, dirichlet_alpha))
+            boundaries = (np.cumsum(proportions) * len(label_indices)).astype(int)
+            boundaries = np.clip(boundaries, 0, len(label_indices))
+            chunks = np.split(label_indices, boundaries[:-1])
+            for cid, chunk in enumerate(chunks):
+                client_index_lists[cid].extend(chunk.tolist())
+
+        splits = client_index_lists
+
     else:
         if shuffle:
             rng.shuffle(indices)
-
         splits = np.array_split(indices, num_clients)
+
     clients = []
     for cid, idxs in enumerate(splits):
         clients.append(Client(

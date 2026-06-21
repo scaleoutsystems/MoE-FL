@@ -3,14 +3,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-#from torchvision.datasets import ImageNet
 from torchvision import transforms
 
 from timm.loss import SoftTargetCrossEntropy
 from timm.data import create_transform, Mixup
 from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 
-from utils.fl_utils import init_clients, lr_schedule, expert_weighted_fedavg
+from utils.fl_utils import init_clients, lr_schedule, fedadam
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
 from utils.data_utils import ImageNetSubset
@@ -25,14 +24,18 @@ torch._dynamo.config.cache_size_limit = 64
 
 seed=42
 num_clients = 20
-num_rounds = 600
+num_rounds = 500
 local_epochs = 5
-client_frac = 0.2
+client_frac = 0.4
+server_lr =  5e-3
+server_betas = (0.9,0.99)
+server_eps = 1e-5
 
 batch_size = 64
-base_lr = 0.025
-start_lr = 0.005
-warmup_rounds = 30
+base_lr = 0.07
+start_lr = 0.007
+end_lr= 1e-6
+warmup_rounds = 50
 
 label_smoothing = 0.1
 
@@ -45,22 +48,22 @@ mlp_ratio = 2
 capacity_ratio = 1.0
 
 #Comments are full imagenet augments we reduce for the subset/FL setting
-auto_augment ="rand-m4-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
-rand_erase_p = 0.15 #0.25
+auto_augment ="rand-m9-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+rand_erase_p = 0.2 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
-cutmix_alpha = 0.5 #1.0
-mixup_alpha = 0.2 #0.8
-mix_prob = 0.3 #0.6
+cutmix_alpha = 0.8 #1.0
+mixup_alpha = 0.6 #0.8
+mix_prob = 0.5 #0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
-color_jitter = 0.4
+color_jitter = 0.5
 interpolation = "bicubic"
 
 opt_kwargs = {
     "lr": base_lr,
     "momentum": 0.9,
-    "weight_decay": 3e-4,
+    "weight_decay": 0.0,
     "nesterov": True,
 }
 
@@ -76,6 +79,10 @@ val_dl_kwargs = {**dl_kwargs, "drop_last": False}
 cfg = {
     "seed": seed,
     "fed": {
+        "agg": "fedadam",
+        "server_lr": server_lr,
+        "server_betas": server_betas,
+        "server_eps": server_eps,
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "client_frac": client_frac,
@@ -87,6 +94,7 @@ cfg = {
         "sched" : "lin_warmup_cosine_annealing",
         "base_lr": base_lr,
         "start_lr": start_lr,
+        "end_lr": end_lr,
         "warmup_rounds": warmup_rounds,
         "kwargs": opt_kwargs,
     },
@@ -108,6 +116,7 @@ cfg = {
             "random_erase_mode": rand_erase_mode,
         },
         "interpolation": interpolation,
+        "color_jitter": color_jitter,
     },
     "reg": {
         "label_smoothing": label_smoothing,
@@ -125,6 +134,7 @@ cfg = {
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 #Transforms 
 val_transform = transforms.Compose([
@@ -174,15 +184,15 @@ def model_fn():
                                 num_classes=100,collect_expert_stats=True)
 
 if __name__ == "__main__":
-    ctx = init_run("imagenet_convnext_moe_fl", cfg)
+    ctx = init_run("imagenet_convnext_moe_fl_standard_table", cfg)
     print("Run dir:", ctx["run_dir"])
 
     print("Loading data...") 
-    train = ImageNetSubset(root='data',split='train', transform=train_transform)
-    val = ImageNetSubset(root='data',split='val', transform=val_transform)
+    train = ImageNetSubset(root='/project/home/p201222/imnet_subset',split='train', transform=train_transform)
+    val = ImageNetSubset(root='/project/home/p201222/imnet_subset',split='val', transform=val_transform)
 
     #Global eval loaders 
-    val_loader = DataLoader(val, batch_size=256, shuffle=False,persistent_workers=True, **val_dl_kwargs)
+    val_loader = DataLoader(val, batch_size=128, shuffle=False, **val_dl_kwargs)
     print("Data loaded")
 
     # Client loaders 
@@ -197,7 +207,7 @@ if __name__ == "__main__":
     )
             
     lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
-                        total_rounds=num_rounds, start_lr=start_lr)
+                        total_rounds=num_rounds, start_lr=start_lr,end_lr=end_lr)
 
     global_model = fl_loop(clients=clients, 
                         model_fn=model_fn,
@@ -212,7 +222,8 @@ if __name__ == "__main__":
                         fl_kwargs=cfg['fed'],
                         opt_kwargs=opt_kwargs,
                         num_gpus=4,
-                        agg_fn=expert_weighted_fedavg)
+                        eval_every=5,
+                        agg_fn=fedadam)
 
     va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
     print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

@@ -10,7 +10,7 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.data import create_transform, Mixup
 from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 
-from utils.fl_utils import init_clients, lr_schedule
+from utils.fl_utils import init_clients, lr_schedule, fedadam
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
 from utils.data_utils import WeatherImageNetSubset
@@ -24,12 +24,16 @@ num_clients = 20
 num_rounds = 500
 local_epochs = 5
 client_frac = 0.4
+server_lr = 5e-3
+server_betas = (0.9,0.99)
+server_eps = 1e-5
 
 batch_size = 64
-base_lr = 0.04
-start_lr = 0.004
+base_lr = 0.07
+start_lr = 0.007
 end_lr = 1e-6
-warmup_rounds = num_rounds * 0.1
+warmup_rounds = 50
+
 
 label_smoothing = 0.1
 
@@ -37,13 +41,13 @@ fedprox = False
 mu = 0
 
 #Comments are full imagenet augments we reduce for the subset/FL setting
-auto_augment ="rand-m4-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+auto_augment ="rand-m7-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
 rand_erase_p = 0.15 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
-cutmix_alpha = 0.5 #1.0
-mixup_alpha = 0.2 #0.8
-mix_prob = 0.3 #0.6
+cutmix_alpha = 0.65 #1.0
+mixup_alpha = 0.4 #0.8
+mix_prob = 0.4 #0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
 color_jitter = 0.4
@@ -69,18 +73,22 @@ val_dl_kwargs = {**dl_kwargs, "drop_last": False}
 cfg = {
     "seed": seed,
     "fed": {
+        "agg": "fedadam",
+        "server_lr": server_lr,
+        "server_betas": server_betas,
+        "server_eps": server_eps,
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "client_frac": client_frac,
         "local_epochs": local_epochs,
         "fedprox": fedprox,
         "mu": mu,
-        "agg": "fedavg",
     },
     "optim": {
         "sched" : "lin_warmup_cosine_annealing",
         "base_lr": base_lr,
         "start_lr": start_lr,
+        "end_lr": end_lr,
         "warmup_rounds": warmup_rounds,
         "kwargs": opt_kwargs,
     },
@@ -161,17 +169,17 @@ def model_fn():
     return convnext_tiny(weights=None,num_classes=100)
 
 if __name__ == "__main__":
-    ctx = init_run("imagenet_weather_convnext_fl", cfg)
+    ctx = init_run("imagenet_convnext_fl_weather_final_table", cfg)
     print("Run dir:", ctx["run_dir"])
 
     print("Loading data...")
 
     #Train transform is handled by init_clients
-    train = WeatherImageNetSubset(root='data/imnet_subset_weather_aug', split='train', transform=train_transform)
-    val = WeatherImageNetSubset(root='data/imnet_subset_weather_aug',split='val', transform=val_transform)
+    train = WeatherImageNetSubset(root='/project/home/p201222/imnet_subset_weather_aug', split='train', transform=train_transform)
+    val = WeatherImageNetSubset(root='/project/home/p201222/imnet_subset_weather_aug',split='val', transform=val_transform)
 
     #Global eval loader
-    val_loader = DataLoader(val, batch_size=128, shuffle=False, **val_dl_kwargs)
+    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **val_dl_kwargs)
     print("Data loaded")
 
     clients = init_clients(
@@ -185,22 +193,23 @@ if __name__ == "__main__":
     )
             
     lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
-                        total_rounds=num_rounds, start_lr=start_lr)
+                        total_rounds=num_rounds, start_lr=start_lr, end_lr=end_lr)
 
     global_model = fl_loop(clients=clients, 
-                            model_fn=model_fn,
-                            opt_fn = opt_fn,
-                            train_loss_fn=train_loss_fn,
-                            eval_loss_fn=eval_loss_fn,
-                            lr_sched=lr_sched,
-                            mix_transform=mix_transform,
-                            val_loader=val_loader,
-                            device=device,
-                            ctx=ctx,
-                            eval_every=5,
-                            fl_kwargs=cfg['fed'],
-                            opt_kwargs=opt_kwargs,
-                            num_gpus=4)
+                        model_fn=model_fn,
+                        opt_fn = opt_fn,
+                        train_loss_fn=train_loss_fn,
+                        eval_loss_fn=eval_loss_fn,
+                        lr_sched=lr_sched,
+                        mix_transform=mix_transform,
+                        val_loader=val_loader,
+                        device=device,
+                        ctx=ctx,
+                        fl_kwargs=cfg['fed'],
+                        opt_kwargs=opt_kwargs,
+                        num_gpus=4,
+                        eval_every=5,
+                        agg_fn=fedadam)
 
     va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
     print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

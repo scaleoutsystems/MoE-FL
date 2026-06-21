@@ -22,30 +22,7 @@ CONTROLNET_CANNY = "diffusers/controlnet-canny-sdxl-1.0"
 MIN_SIZE = 768
 MAX_SIZE = 1024
 DEVICE = "cuda:0" #SLURM handles the GPU assignments to processes internally
-STRENGTH = 0.95
-GUIDANCE_SCALE = 11
-CONTROLNET_DEPTH_SCALE = 0.6
-CONTROLNET_CANNY_SCALE = 0.6
-NUM_STEPS = 15
 
-WEATHER_CONFIGS = {
-    "rain": {
-        "prompt": "{label}, torrential rain, heavy rain streaks, thick falling raindrops, completely drenched, dramatic downpour, large puddles, soaking wet reflective surfaces",
-        "negative": "dry, sunshine, clear sky, bright colors, warm tones, snow, fog, style change, painting, cartoon, deformed, artifacts",
-    },
-    "fog": {
-        "prompt": "{label}, extremely thick dense fog, heavy fog filling the entire scene, fog in the foreground and background, foreground objects obscured by fog, near zero visibility, impenetrable fog wall, thick fog covering the whole image, no clear areas, uniform dense fog everywhere",
-        "negative": "clear visibility, sharp details, visible background, bright colors, sunshine, rain, snow, dry, style change, painting, cartoon, deformed, artifacts",
-    },
-    "snow": {
-        "prompt": "{label}, whiteout blizzard, heavy snowfall, thick snowflakes filling the air, snow covering every surface, white overcast sky, snowstorm",
-        "negative": "dry ground, bare ground, green grass, warm tones, sunshine, rain, fog, summer, style change, painting, cartoon, deformed, artifacts",
-    },
-    "sunny": {
-        "prompt": "{label}, harsh midday sunlight, intense sunbeams, deep hard shadows, strong sunlight, warm golden light, bright glare",
-        "negative": "overcast, clouds, rain, fog, snow, dark sky, muted colors, style change, painting, cartoon, deformed, artifacts",
-    },
-}
 
 ####################### Helpers ##############################
 

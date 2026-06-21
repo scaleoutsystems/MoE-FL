@@ -3,71 +3,86 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torchvision.datasets import Imagenette
 from torchvision import transforms
 
 from timm.loss import SoftTargetCrossEntropy
 from timm.data import create_transform, Mixup
 from timm.data.constants import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 
-from utils.fl_utils import init_clients, lr_schedule
+from utils.fl_utils import init_clients, lr_schedule, fedadam
 from utils.training_utils import evaluate, fl_loop
 from utils.experiment_tracking import init_run
+from utils.data_utils import WeatherImageNetSubset
 from custom_modules.convnext_moe import convnext_moe_model_fn
 
 #Reproducability and GPU
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Running on:", device)
 
-seed=42
-num_clients = 10
-num_rounds = 300
-local_epochs = 1
-client_frac = 0.5
+#There are graph breaks in the MoE model this allows torch.compile to work better
+torch._dynamo.config.cache_size_limit = 64
 
-batch_size = 128
-base_lr = 4e-3
-start_lr = 1e-3
-warmup_rounds = 20
+seed=42
+num_clients = 20
+num_rounds = 500
+local_epochs = 5
+client_frac = 0.4
+server_lr =  5e-3
+server_betas = (0.9,0.99)
+server_eps = 1e-5
+
+batch_size = 64
+base_lr = 0.07
+start_lr = 0.007
+end_lr= 1e-6
+warmup_rounds = 50
 
 label_smoothing = 0.1
 
-fedprox = True
-mu = 1e-3
+fedprox = False
+mu = 0
 
 num_experts = 4
 top_k = 1
 mlp_ratio = 2
 capacity_ratio = 1.0
 
-auto_augment = "rand-m9-mstd0.5-inc1"
-rand_erase_p = 0.25
+#Comments are full imagenet augments we reduce for the subset/FL setting
+auto_augment ="rand-m9-mstd0.5-inc1" #"rand-m9-mstd0.5-inc1"
+rand_erase_p = 0.2 #0.25
 rand_erase_mode="pixel"
 rand_erase_count=1
-cutmix_alpha = 1.0
-mixup_alpha = 0.8
-mix_prob = 1.0
+cutmix_alpha = 0.8 #1.0
+mixup_alpha = 0.6 #0.8
+mix_prob = 0.5 #0.6
 mix_mode = "batch"
 mix_switch_prob = 0.5
-color_jitter = 0.4
+color_jitter = 0.5
 interpolation = "bicubic"
 
 opt_kwargs = {
     "lr": base_lr,
-    "betas": (0.9, 0.999),
-    "weight_decay": 0.05,
+    "momentum": 0.9,
+    "weight_decay": 0.0,
+    "nesterov": True,
 }
 
 dl_kwargs = {
-    #"num_workers": 8,
+    "num_workers": 8,
     "pin_memory": (device == "cuda"),
-    #"prefetch_factor": 4,
+    "prefetch_factor": 4,
     "drop_last": True,
 }
+
+val_dl_kwargs = {**dl_kwargs, "drop_last": False}
 
 cfg = {
     "seed": seed,
     "fed": {
+        "agg": "fedadam",
+        "server_lr": server_lr,
+        "server_betas": server_betas,
+        "server_eps": server_eps,
         "num_clients": num_clients,
         "num_rounds": num_rounds,
         "client_frac": client_frac,
@@ -79,6 +94,7 @@ cfg = {
         "sched" : "lin_warmup_cosine_annealing",
         "base_lr": base_lr,
         "start_lr": start_lr,
+        "end_lr": end_lr,
         "warmup_rounds": warmup_rounds,
         "kwargs": opt_kwargs,
     },
@@ -100,6 +116,7 @@ cfg = {
             "random_erase_mode": rand_erase_mode,
         },
         "interpolation": interpolation,
+        "color_jitter": color_jitter,
     },
     "reg": {
         "label_smoothing": label_smoothing,
@@ -117,6 +134,7 @@ cfg = {
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 #Transforms 
 val_transform = transforms.Compose([
@@ -149,33 +167,8 @@ mix_transform = Mixup(
     switch_prob=mix_switch_prob,
     mode=mix_mode,
     label_smoothing=label_smoothing,
-    num_classes=10, 
+    num_classes=100, 
 )
-
-ctx = init_run("imagenet_convnext_moe_fl", cfg)
-print("Run dir:", ctx["run_dir"])
-
-print("Loading data...")
-train = Imagenette(root='data',split='train', transform=train_transform)
-val = Imagenette(root='data',split='val', transform=val_transform)
-
-#Global eval loaders 
-train_eval_loader = DataLoader(train, batch_size=batch_size, shuffle=False, **dl_kwargs)
-val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, **dl_kwargs)
-print("Data loaded")
-
-# Client loaders 
-clients = init_clients(
-    dataset=train,
-    num_clients=num_clients,
-    batch_size=batch_size,
-    dl_kwargs=dl_kwargs,
-    seed=seed,
-    shuffle=True,
-)
-        
-lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
-                       total_rounds=num_rounds, start_lr=start_lr)
 
 if mix_transform is not None:
     train_loss_fn = SoftTargetCrossEntropy()
@@ -184,25 +177,53 @@ else:
 eval_loss_fn  = nn.CrossEntropyLoss()
 
 def opt_fn(model, opt_kwargs):
-    return torch.optim.AdamW(model.parameters(), **opt_kwargs)
+    return torch.optim.SGD(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,num_classes=10)
+    return convnext_moe_model_fn(num_experts,top_k,mlp_ratio,capacity_ratio,
+                                num_classes=100,collect_expert_stats=True)
 
-global_model = fl_loop(clients=clients, 
-                       model_fn=model_fn,
-                       opt_fn = opt_fn,
-                       train_loss_fn=train_loss_fn,
-                       eval_loss_fn=eval_loss_fn,
-                       lr_sched=lr_sched,
-                       mix_transform=mix_transform,
-                       val_loader=val_loader,
-                       device=device,
-                       ctx=ctx,
-                       fl_kwargs=cfg['fed'],
-                       opt_kwargs=opt_kwargs)
+if __name__ == "__main__":
+    ctx = init_run("imagenet_convnext_moe_fl_weather_standard_table", cfg)
+    print("Run dir:", ctx["run_dir"])
 
-tr = evaluate(global_model, train_eval_loader, device, loss_fn=eval_loss_fn)
-va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
-print(f"\nFinal Aggregated Model Train Loss: {tr['loss']:.4f}, Train Acc: {tr['acc']:.4f}")
-print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")
+    print("Loading data...") 
+    train = WeatherImageNetSubset(root='/project/home/p201222/imnet_subset_weather_aug',split='train', transform=train_transform)
+    val = WeatherImageNetSubset(root='/project/home/p201222/imnet_subset_weather_aug',split='val', transform=val_transform)
+
+    #Global eval loaders 
+    val_loader = DataLoader(val, batch_size=128, shuffle=False, **val_dl_kwargs)
+    print("Data loaded")
+
+    # Client loaders 
+    clients = init_clients(
+        dataset=train,
+        num_clients=num_clients,
+        batch_size=batch_size,
+        dl_kwargs=dl_kwargs,
+        seed=seed,
+        shuffle=True,
+        transform=train_transform
+    )
+            
+    lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds, 
+                        total_rounds=num_rounds, start_lr=start_lr,end_lr=end_lr)
+
+    global_model = fl_loop(clients=clients, 
+                        model_fn=model_fn,
+                        opt_fn = opt_fn,
+                        train_loss_fn=train_loss_fn,
+                        eval_loss_fn=eval_loss_fn,
+                        lr_sched=lr_sched,
+                        mix_transform=mix_transform,
+                        val_loader=val_loader,
+                        device=device,
+                        ctx=ctx,
+                        fl_kwargs=cfg['fed'],
+                        opt_kwargs=opt_kwargs,
+                        num_gpus=4,
+                        eval_every=5,
+                        agg_fn=fedadam)
+
+    va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+    print(f"Final Aggregated Model Val   Loss: {va['loss']:.4f}, Val   Acc: {va['acc']:.4f}")

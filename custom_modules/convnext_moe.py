@@ -99,7 +99,7 @@ class MoECNBlock(nn.Module, PatchDispatcher):
 
        # moe_out = self.layer_scale * moe_out
         
-        return input + moe_out + x_skip 
+        return input + x_skip + moe_out 
     
 class ConvNeXtExpert(nn.Module):
     def __init__(self, dim, mlp_ratio):

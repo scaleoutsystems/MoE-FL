@@ -1,0 +1,23 @@
+# Deep Learning Core
+torch
+torchvision
+numpy
+scipy
+timm
+
+#Multi GPU training
+ray
+
+# Plotting
+matplotlib
+
+#Image loading
+Pillow
+
+#Weather augmentation
+transformers
+diffusers
+tqdm
+opencv-python
+accelerate
+bitsandbytes

@@ -78,5 +78,10 @@ class WeatherImageNetSubset(ImageNetSubset):
         indices = [i for i, w in enumerate(self.weathers) if w == weather]
         return Subset(self, indices)
 
-    def get_all_weather_subsets(self) -> dict[str, Subset]:
+    def get_all_weather_subsets(self): #-> dict[str, Subset]:
         return {w: self.get_weather_subset(w) for w in self.WEATHERS}
+    
+    # def __getitem__(self, idx):
+    #     img, label = super().__getitem__(idx)
+    #     weather = self.weather_types.index(self.weathers[idx])
+    #     return img, label, weather

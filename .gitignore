@@ -212,3 +212,8 @@ data/*
 #Runs
 runs/*
 succesful_runs/*
+figs/*
+*.png
+sweep/*
+
+weather_augmentations/*.npy

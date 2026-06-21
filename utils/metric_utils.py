@@ -46,23 +46,23 @@ def model_param_bytes(model, bytes_per_param=4):
     P = sum(p.numel() for p in model.parameters())
     return P * bytes_per_param, P
     
-def fedavg_comm_cost_mb(model, num_clients, num_rounds, bytes_per_param=4):
+def fedavg_comm_cost_gb(model, num_clients, num_rounds, participation, bytes_per_param=2):
     model_bytes, P = model_param_bytes(model, bytes_per_param)
 
-    downlink_per_round = num_clients * model_bytes
-    uplink_per_round   = num_clients * model_bytes
+    downlink_per_round = num_clients * model_bytes * participation
+    uplink_per_round   = num_clients * model_bytes * participation
     total_per_round    = downlink_per_round + uplink_per_round
     total_training     = num_rounds * total_per_round
 
-    to_mb = lambda x: x / 1e6  
+    to_gb = lambda x: x / 1e9
 
     return {
         "Parameters": P,
-        "model_MB": to_mb(model_bytes),
-        "downlink_per_round_MB": to_mb(downlink_per_round),
-        "uplink_per_round_MB": to_mb(uplink_per_round),
-        "total_per_round_MB": to_mb(total_per_round),
-        "total_training_MB": to_mb(total_training),
+        "model_GB": to_gb(model_bytes),
+        "downlink_per_round_GB": to_gb(downlink_per_round),
+        "uplink_per_round_GB": to_gb(uplink_per_round),
+        "total_per_round_GB": to_gb(total_per_round),
+        "total_training_GB": to_gb(total_training),
     }
 
 def count_flops(model,inputs,show_table=False,max_depth=4):

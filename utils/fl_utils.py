@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from .data_utils import WeatherImageNetSubset
 import ctypes
 from collections import defaultdict
+import re
 
 #We have to force free the RAM
 def release_memory():
@@ -124,6 +125,60 @@ def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device=
         agg[k] = acc.to(dtype=t0.dtype)
         
     return agg
+
+_EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
+
+def _expert_id_of_key(k):
+    m = _EXPERT_RE.search(k)
+    return int(m.group(1)) if m else None
+
+def context_expert_fedavg(client_states, client_ns, moe_stats, global_params, device="cpu"):
+    device = torch.device(device)
+    # one integer per client: which expert it used
+    client_experts = [int(torch.stack(cs).sum(0).argmax()) for cs in moe_stats]
+
+    total_n = float(sum(client_ns))
+    out = {}
+    for k in client_states[0].keys():
+        ref = client_states[0][k]
+        e = _expert_id_of_key(k)            # same regex helper as before
+
+        if e is None:
+            members = list(zip(client_states, client_ns))
+            denom = total_n
+        else:
+            members = [(cs, n) for cs, n, owned
+                       in zip(client_states, client_ns, client_experts) if owned == e]
+            denom = float(sum(n for _, n in members))
+
+        if not members or denom == 0.0:
+            out[k] = global_params[k].to(device)     # missing expert -> freeze
+            continue
+
+        acc = torch.zeros_like(ref, device=device, dtype=torch.float32)
+        for cs, n in members:
+            acc.add_(cs[k].to(device).float(), alpha=n / denom)
+        out[k] = acc.to(ref.dtype)
+    return out
+
+def context_expert_fedadam(client_states, client_ns, moe_stats, device,
+                           global_model, server_optimizer):
+    global_params = global_model.state_dict()
+    aggregated = context_expert_fedavg(client_states, client_ns, moe_stats,
+                                       global_params, device=device)
+
+    # experts any sampled client used this round
+    used_experts = {int(torch.stack(cs).sum(0).argmax()) for cs in moe_stats}
+
+    server_optimizer.zero_grad(set_to_none=True)
+    for name, param in global_model.named_parameters():
+        e = _expert_id_of_key(name)
+        if e is not None and e not in used_experts:
+            param.grad = None                      # skip -> freeze weight AND Adam moments
+        else:
+            param.grad = param.data - aggregated[name].to(param.device)
+    server_optimizer.step()
+    return global_model.state_dict()
 
 def gating_entropy_expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device="cpu"):
     device = torch.device(device)

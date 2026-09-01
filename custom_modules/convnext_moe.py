@@ -1,120 +1,9 @@
-import torch
-import torch.nn as nn
-from functools import partial
-from typing import Callable, Optional
-from torchvision.ops import Permute
-from .routers import NoisyTopKRouter
-from .patch_dispatcher import PatchDispatcher
 from torchvision.models.convnext import CNBlock
 from torchvision.models import convnext_tiny 
-
-class MoEConvNeXtWrapper(nn.Module):
-    def __init__(self, base: nn.Module, collect_expert_stats):
-        super().__init__()
-        self.base = base
-        self._moe_modules = [m for m in self.base.modules() if hasattr(m, "aux_loss")]
-        self.collect_expert_stats = collect_expert_stats
-
-    def forward(self, x, return_aux: bool = False):
-        logits = self.base(x)
-        if not return_aux:
-            return logits
-        return logits, self.get_aux_loss()
-
-    #To make torch.compile not cause recompiles
-    @torch.compiler.disable
-    def get_aux_loss(self):
-        aux = None
-        for m in self._moe_modules:
-            a = m.aux_loss
-            if a is None:
-                continue
-            aux = a if aux is None else aux + a
-        if aux is None:
-            aux = next(self.base.parameters()).new_zeros(())
-        return aux
-    
-    def pop_expert_stats(self):
-        stats = []
-        #Append stats for each moe layer
-        for m in self._moe_modules:
-            stats.append(m.expert_stats.cpu())
-            m.expert_stats.zero_()
-        return stats
-    
-
-class MoECNBlock(nn.Module, PatchDispatcher): 
-    def __init__(
-        self,
-        dim: int,
-        num_experts: int,
-        top_k: int,
-        mlp_ratio: int,
-        capacity_ratio : float,
-        layer_scale: float,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-    ):
-        super().__init__()
-        
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-
-        self.dwconv = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim, bias=True),
-            Permute([0, 2, 3, 1]),
-            norm_layer(dim),
-        )
-
-        self.router = NoisyTopKRouter(dim, num_experts, top_k)
-        self.experts = nn.ModuleList([ConvNeXtExpert(dim, mlp_ratio) for _ in range(num_experts)])
-        self.permute_back = Permute([0, 3, 1, 2])
-        self.aux_loss = torch.tensor(0.0)
-        self.capacity_ratio = capacity_ratio
-        self.num_experts = num_experts
-        self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
-
-        #self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
-
-    #This module may not work well with torch.compile
-    @torch.compiler.disable
-    def forward(self, input):
-        x = self.dwconv(input)  # (N, H, W, C)
-        N, H, W, C = x.shape
-        x_flat = x.reshape(-1, C)  # [T, C]
-
-        topi, weights, priority, aux_loss = self.router(x_flat, return_aux=self.training)
-        order = torch.argsort(priority, descending=True)
-        moe_flat = self.moe_route(x_flat, topi, weights, order)  # [T, C]
-        
-        if aux_loss is None:
-           self.aux_loss = x_flat.new_zeros(())
-        else:
-           self.aux_loss = aux_loss
-            
-        #Additional skip connection described in paper       
-        x_skip = self.permute_back(x)
-
-        moe_out = moe_flat.view(N, H, W, C)
-        moe_out = self.permute_back(moe_out)  # (N, C, H, W)
-
-       # moe_out = self.layer_scale * moe_out
-        
-        return input + x_skip + moe_out 
-    
-class ConvNeXtExpert(nn.Module):
-    def __init__(self, dim, mlp_ratio):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, mlp_ratio * dim),
-            nn.GELU(),
-            nn.Linear(mlp_ratio * dim, dim),
-        )
-
-    def forward(self, x):
-        return self.block(x)
+from .convnext_moe_blocks import MoEConvNeXtWrapper, MoECNBlock
     
 #For convnext_tiny    
-def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ratio=1.0):
+def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ratio=1.0,context_aware=False):
     # convnext_tiny stage dims and number of blocks
     stage_depth = {96: 3, 192: 3, 384: 9, 768: 3}
 
@@ -142,6 +31,7 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
                 layer_scale=layer_scale,
                 norm_layer=norm_layer,
                 capacity_ratio=capacity_ratio,
+                context_aware=context_aware,
             )
         else:
             return CNBlock(
@@ -155,11 +45,12 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
 
 # Model factory 
 def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0,
-                          collect_expert_stats=False,num_classes=1000):
+                          collect_expert_stats=False,num_classes=1000,context_aware=False):
     block_factory = make_last_block_moe_factory(
         num_experts=num_experts,
         top_k=top_k,
         mlp_ratio=mlp_ratio,
         capacity_ratio=capacity_ratio,
+        context_aware=context_aware
     )
     return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=num_classes, block=block_factory),collect_expert_stats)

@@ -10,18 +10,39 @@ from copy import deepcopy
 from functools import partial
 from collections import defaultdict
 from torch.amp import autocast, GradScaler
-from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg, fedadam, expert_weighted_fedadam, expert_weighted_fedavg
+from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg, fedadam, expert_weighted_fedadam, expert_weighted_fedavg, context_expert_fedadam
 from .experiment_tracking import log_and_checkpoint, log_client_metrics, load_checkpoint, log_routing_metrics
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from timm.data import Mixup
+
+class ContextMixup(Mixup):
+
+    def __call__(self, x, target, context=None):
+        if context is not None:
+            x, target, _ = self._pair_within_context(x, target, context)
+        return super().__call__(x, target)
+
+    @staticmethod
+    def _pair_within_context(x, target, context):
+        l, r = [], []
+        for g in torch.unique(context):
+            pos = (context == g).nonzero(as_tuple=True)[0]
+            pos = pos[torch.randperm(pos.numel(), device=pos.device)]
+            h = pos.numel() // 2
+            l.append(pos[:h]); r.append(pos[h:2 * h])
+        order = torch.cat(l + [torch.cat(r).flip(0)])
+        ctx = context[order]
+        assert (ctx == ctx.flip(0)).all()
+        return x[order], target[order], ctx
 
 def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
                           loss_fn, eval_loss_fn, scheduler_fn,
                           mix_transform, ctx, opt_kwargs,
                           num_epochs=300, eval_every=5,
                           amp_dtype=torch.bfloat16, ckpt_path=None,
-                          batch_size=512, num_workers=4):
+                          batch_size=512, num_workers=4, **dl_kwargs):
 
     dist.init_process_group(backend="nccl")
     rank       = dist.get_rank()
@@ -35,11 +56,11 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
     train_loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
                                                 sampler=train_sampler,
                                                 num_workers=num_workers,
-                                                pin_memory=True)
+                                                **dl_kwargs)
     val_loader    = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size,
                                                 sampler=val_sampler,
                                                 num_workers=num_workers,
-                                                pin_memory=True)
+                                                **dl_kwargs)
 
     model   = torch.compile(model_fn().to(device))
     model   = DDP(model, device_ids=[rank])
@@ -186,7 +207,13 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
         correct = torch.zeros((), device=device, dtype=torch.long)
         total   = torch.zeros((), device=device, dtype=torch.long)
 
-        for x, y in loader:
+        for batch in loader:
+            if len(batch) == 3:
+                x, y, context = batch
+                context = context.to(device, non_blocking=True)
+            else:
+                x, y = batch
+                context = None
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
@@ -195,17 +222,14 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
 
             optimizer.zero_grad(set_to_none=True)
 
-            #Tesla T4 uses f16
-            #A100 uses bfloat16
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                if has_aux:
-                    logits, aux = model(x, return_aux=True)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss + aux
-                else:
-                    logits = model(x)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss
+            if has_aux:
+                logits, aux = model(x, context=context, return_aux=True)
+                base_loss = loss_fn(logits, y)
+                total_loss = base_loss + aux
+            else:
+                logits = model(x)
+                base_loss = loss_fn(logits, y)
+                total_loss = base_loss
 
             prox_term = None
             if fedprox and mu > 0.0:
@@ -585,7 +609,7 @@ def fl_loop(clients,model_fn,opt_fn,
     global_model = model_fn()
     routing_model = None
     
-    if agg_fn is fedadam or agg_fn is expert_weighted_fedadam:
+    if (agg_fn is fedadam) or (agg_fn is expert_weighted_fedadam) or (agg_fn is context_expert_fedadam):
         server_optimizer = torch.optim.Adam(
             global_model.parameters(),
             lr=fl_kwargs['server_lr'],
@@ -675,7 +699,7 @@ def fl_loop(clients,model_fn,opt_fn,
         client_metrics = [{"cid": r["cid"], "num_samples": r["num_samples"],
                            "history": r["history"]} for r in results]
         
-        if agg_fn is expert_weighted_fedadam:
+        if (agg_fn is expert_weighted_fedadam) or (agg_fn is context_expert_fedadam):
             client_expert_stats = [r["moe_stats"] for r in results]
             round_agg_fn = partial(agg_fn,global_model=global_model,
                                    server_optimizer=server_optimizer,

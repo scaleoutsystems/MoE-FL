@@ -98,6 +98,7 @@ class NoisyTopKRouter(nn.Module):
 
         return topi, weights, priority, aux_loss
     
+
     
 #Switch router from paper
 class SwitchRouter(nn.Module):
@@ -126,7 +127,7 @@ class SwitchRouter(nn.Module):
 
         # f_i: fraction of tokens routed to expert i (hard counts)
         counts = torch.bincount(top1, minlength=E).float()        
-        f = counts / (B + self.eps)                                   
+        f = counts / B                                    
         # p_i: mean probability mass for expert i 
         p = probs.mean(dim=0)                                
 
@@ -151,9 +152,52 @@ class SwitchRouter(nn.Module):
         weights = top1_prob[:, None]         
 
         #Randomize so overflow does not always drop the same tokens
-        priority = -torch.arange(T, device=x.device, dtype=x.dtype)
+        #priority = -torch.arange(T, device=x.device, dtype=x.dtype)
+        priority = torch.randperm(T, device=x.device).to(x.dtype)
 
         #Add aux_loss if set to true
         aux_loss = self._load_loss(probs, top1) if (return_aux and self.training) else None
         
+        return topi, weights, priority, aux_loss
+    
+class ContextRouterLogitCE(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        top_k: int = 1,
+        context_coeff: float = 0.1,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.context_coeff = context_coeff
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        nn.init.normal_(self.gate.weight, std=0.02)
+
+    def _context_aux_loss(self, logits, context_label):
+        # CE over ALL logits: pushes target expert to rank first, gives
+        # gradient to every expert (target up, competitors down).
+        return self.context_coeff * F.cross_entropy(logits, context_label)
+    
+    def forward(self, x, context_label=None, return_aux=True):
+        logits = self.gate(x)  # (B, N)
+
+        topv, topi = logits.topk(self.top_k, dim=-1)
+        masked = logits.new_full(logits.shape, float("-inf"))
+        masked.scatter_(-1, topi, topv)
+        gates_full = torch.softmax(masked, dim=-1)
+        weights = gates_full.gather(-1, topi)          # constant 1.0 when top_k==1
+        priority = weights.max(dim=-1).values
+
+        aux_loss = None
+        if (
+            return_aux
+            and self.training
+            and self.context_coeff != 0.0
+            and context_label is not None
+        ):
+            aux_loss = self._context_aux_loss(logits, context_label)
+
         return topi, weights, priority, aux_loss

@@ -62,12 +62,13 @@ class ImageNetSubset(ImageNet):
     
     
 class WeatherImageNetSubset(ImageNetSubset):
-    def __init__(self, root, split="train", transform=None):
+    def __init__(self, root, split="train", transform=None,return_weather=False):
         super().__init__(root=root, split=split, transform=transform)
         #The available weather augmentations
         self.weather_types = ["sunny", "fog", "rain", "snow"]
         #The weather labels for each data point
         self.weathers = [self._parse_weather(p) for p, _ in self.imgs]
+        self.return_weather = return_weather
 
     def _parse_weather(self, path):
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -79,9 +80,11 @@ class WeatherImageNetSubset(ImageNetSubset):
         return Subset(self, indices)
 
     def get_all_weather_subsets(self): #-> dict[str, Subset]:
-        return {w: self.get_weather_subset(w) for w in self.WEATHERS}
+        return {w: self.get_weather_subset(w) for w in self.weather_types}
     
-    # def __getitem__(self, idx):
-    #     img, label = super().__getitem__(idx)
-    #     weather = self.weather_types.index(self.weathers[idx])
-    #     return img, label, weather
+    def __getitem__(self, idx):
+        img, label = super().__getitem__(idx)
+        if not self.return_weather:
+            return img, label
+        weather = self.weather_types.index(self.weathers[idx])
+        return img, label, weather

@@ -3,7 +3,7 @@ from torchvision.models import convnext_tiny
 from .convnext_moe_blocks import MoEConvNeXtWrapper, MoECNBlock
     
 #For convnext_tiny    
-def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ratio=1.0,context_aware=False):
+def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ratio=1.0,bpr=True,context_aware=False,allowed_experts=None):
     # convnext_tiny stage dims and number of blocks
     stage_depth = {96: 3, 192: 3, 384: 9, 768: 3}
 
@@ -32,6 +32,8 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
                 norm_layer=norm_layer,
                 capacity_ratio=capacity_ratio,
                 context_aware=context_aware,
+                bpr=bpr,
+                allowed_experts=allowed_experts,
             )
         else:
             return CNBlock(
@@ -45,12 +47,14 @@ def make_last_block_moe_factory(num_experts=4, top_k=1, mlp_ratio=4, capacity_ra
 
 # Model factory 
 def convnext_moe_model_fn(num_experts=4,top_k=1,mlp_ratio=2,capacity_ratio=1.0,
-                          collect_expert_stats=False,num_classes=1000,context_aware=False):
+                          collect_expert_stats=False,num_classes=1000,bpr=True,context_aware=False,allowed_experts=None):
     block_factory = make_last_block_moe_factory(
         num_experts=num_experts,
         top_k=top_k,
         mlp_ratio=mlp_ratio,
         capacity_ratio=capacity_ratio,
-        context_aware=context_aware
+        bpr=bpr,
+        context_aware=context_aware,
+        allowed_experts=allowed_experts,
     )
     return MoEConvNeXtWrapper(convnext_tiny(weights=None, num_classes=num_classes, block=block_factory),collect_expert_stats)

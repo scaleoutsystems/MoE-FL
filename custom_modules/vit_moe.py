@@ -42,12 +42,14 @@ class MoEViTBlock(nn.Module, PatchDispatcher):
         self.experts = nn.ModuleList([ViTExpert(dim, mlp_ratio) for _ in range(num_experts)])
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = capacity_ratio
+        self.bpr = True
+        self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
 
     def forward(self, x):
         B, N, C = x.shape
         x_flat = x.reshape(B * N, C)
 
-        topi, weights, priority, aux_loss = self.router(x_flat, return_aux=self.training)
+        topi, weights, priority, aux_loss, _ = self.router(x_flat, return_aux=self.training)
         order = torch.argsort(priority, descending=True)
         moe_flat = self.moe_route(x_flat, topi, weights, order)
         

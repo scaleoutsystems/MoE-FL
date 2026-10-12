@@ -3,7 +3,7 @@ import torch.nn as nn
 from functools import partial
 from typing import Callable, Optional
 from torchvision.ops import Permute
-from .routers import NoisyTopKRouter, ContextAwareNoisyTopKRouter, ContextRouterLogitCE
+from .routers import NoisyTopKRouter, ContextRouterLogitCE
 from .patch_dispatcher import PatchDispatcher
 
 class MoEConvNeXtWrapper(nn.Module):
@@ -19,12 +19,16 @@ class MoEConvNeXtWrapper(nn.Module):
         for m in self._moe_modules:
             m._context = context
 
-    def forward(self, x,context=None, return_aux: bool = False):
-        # logits = self.base(x)
-        # if not return_aux:
-        #     return logits
-        # return logits, self.get_aux_loss()
-        self._set_context(context)
+    #Restricts dispatch to a subset of experts (e.g. the experts a federated
+    #client owns). None removes the restriction.
+    @torch.compiler.disable
+    def set_allowed_experts(self, allowed_experts):
+        for m in self._moe_modules:
+            m.allowed_experts = allowed_experts
+
+    def forward(self, x, context=None, return_aux: bool = False):
+        if context is not None:
+            self._set_context(context)
         logits = self.base(x)
         self._set_context(None)  # don't let stale context leak into the next call
         if not return_aux:
@@ -48,10 +52,54 @@ class MoEConvNeXtWrapper(nn.Module):
         stats = []
         #Append stats for each moe layer
         for m in self._moe_modules:
-            stats.append(m.expert_stats.cpu())
+            #clone: on CPU .cpu() returns the buffer itself, which zero_() would wipe
+            stats.append(m.expert_stats.detach().cpu().clone())
             m.expert_stats.zero_()
         return stats
-    
+
+
+def _remap_disallowed_experts(topi, logits, allowed_expert_ids):
+    T, k = topi.shape
+    E = logits.shape[1]
+    device = topi.device
+
+    allowed_mask = torch.zeros(E, dtype=torch.bool, device=device)
+    allowed_ids = torch.as_tensor(list(allowed_expert_ids), device=device, dtype=torch.long)
+    allowed_mask[allowed_ids] = True
+
+    assert allowed_ids.numel() >= k, (
+        f"allowed_expert_ids has {allowed_ids.numel()} experts, fewer than top_k={k}"
+    )
+
+    masked_logits = logits.masked_fill(~allowed_mask.unsqueeze(0), float("-inf"))
+    new_topi = topi.clone()
+
+    for slot in range(k):
+        needs_fix = ~allowed_mask[topi[:, slot]]
+        if not needs_fix.any():
+            continue
+        cand_logits = masked_logits.clone()
+        for other in range(k):
+            if other == slot:
+                continue
+            cand_logits.scatter_(1, new_topi[:, other:other + 1], float("-inf"))
+        best_allowed = cand_logits.argmax(dim=-1)
+        new_topi[needs_fix, slot] = best_allowed[needs_fix]
+
+    return new_topi
+
+
+def remap_dispatch_only(topi, weights, priority, logits, allowed_experts):
+    """
+    Default expert-restriction strategy: reroutes disallowed picks to the
+    best allowed alternative for dispatch only. weights/priority are left
+    untouched, they still reflect the router's original, unrestricted
+    decision, so the gating network's gradient signal is unaffected by
+    which experts happen to be locally available (e.g. a federated client).
+    """
+    new_topi = _remap_disallowed_experts(topi, logits, allowed_experts)
+    return new_topi, weights, priority
+
 
 class MoECNBlock(nn.Module, PatchDispatcher): 
     def __init__(
@@ -64,6 +112,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         layer_scale: float,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         context_aware: bool = False,
+        bpr: bool = True,
+        allowed_experts: Optional[list] = None,
+        restriction_fn: Callable = remap_dispatch_only,
     ):
         super().__init__()
         
@@ -86,6 +137,9 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         self.aux_loss = torch.tensor(0.0)
         self.capacity_ratio = capacity_ratio
         self.num_experts = num_experts
+        self.bpr = bpr
+        self.allowed_experts = allowed_experts
+        self.restriction_fn = restriction_fn
         self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
 
         #self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
@@ -99,24 +153,24 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         
         context_tok = None
         if self._context is not None:
-            # (N,) -> (T,): each image's label repeated over its H*W patches
+            # (N,) -> (T,): each image's context label repeated over its H*W patches
             context_tok = self._context.to(x_flat.device).repeat_interleave(H * W)
 
-        # topi, weights, priority, aux_loss = self.router(
-        #     x_flat, context_label=context_tok, return_aux=self.training
-        # )
         router_kwargs = {"return_aux": self.training}
         if context_tok is not None:
             router_kwargs["context_label"] = context_tok
 
-        topi, weights, priority, aux_loss = self.router(x_flat, **router_kwargs)
+        topi, weights, priority, aux_loss, logits = self.router(x_flat, **router_kwargs)
 
-        
-        if self._context is not None:
-            topi = torch.full_like(topi, int(self._context[0]))
+        if self.allowed_experts is not None:
+            topi, weights, priority = self.restriction_fn(
+                topi, weights, priority, logits, self.allowed_experts
+            )
 
-        #topi, weights, priority, aux_loss = self.router(x_flat, return_aux=self.training)
-        order = torch.argsort(priority, descending=True)
+        if self.bpr:
+            order = torch.argsort(priority, descending=True)
+        else:
+            order = torch.arange(x_flat.shape[0], device=x_flat.device)
         moe_flat = self.moe_route(x_flat, topi, weights, order)  # [T, C]
         
         if aux_loss is None:

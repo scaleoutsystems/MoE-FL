@@ -96,7 +96,7 @@ class NoisyTopKRouter(nn.Module):
                 aux = aux + self._load_loss(logits, noise_std, noisy_logits)  # uses noisy threshold
             aux_loss = aux
 
-        return topi, weights, priority, aux_loss
+        return topi, weights, priority, aux_loss, noisy_logits
     
 
     
@@ -158,7 +158,7 @@ class SwitchRouter(nn.Module):
         #Add aux_loss if set to true
         aux_loss = self._load_loss(probs, top1) if (return_aux and self.training) else None
         
-        return topi, weights, priority, aux_loss
+        return topi, weights, priority, aux_loss, logits
     
 class ContextRouterLogitCE(nn.Module):
     def __init__(
@@ -200,4 +200,4 @@ class ContextRouterLogitCE(nn.Module):
         ):
             aux_loss = self._context_aux_loss(logits, context_label)
 
-        return topi, weights, priority, aux_loss
+        return topi, weights, priority, aux_loss, logits

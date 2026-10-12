@@ -422,6 +422,11 @@ def compute_routing_metrics(round_idx, routing_model, global_params,
         "global_load_balance": global_load_balance,
     }
 
+def _set_client_experts(model, client):
+    #Restrict dispatch to the client's experts (None = unrestricted)
+    if hasattr(model, "set_allowed_experts"):
+        model.set_allowed_experts(client.allowed_experts)
+
 @ray.remote(num_gpus=1)
 class ClientWorker:
     def __init__(self, model_fn, amp_dtype,seed=42):
@@ -446,6 +451,7 @@ class ClientWorker:
         set_lr(optimizer, lr_r)
         snap = [p.to(self.device) for p in snap_cpu] if snap_cpu else None
         loader = client.get_loader(in_memory=False)
+        _set_client_experts(self.model, client)
 
         hist = train_client(
             self.model, loader, self.device, optimizer,
@@ -458,6 +464,7 @@ class ClientWorker:
         result = {
             "cid": client.cid,
             "num_samples": client.num_samples,
+            "allowed_experts": client.allowed_experts,
             "state": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "history": hist,
         }
@@ -515,6 +522,7 @@ def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_
             selected_clients[i + 1].prefetch()
 
         local_model.load_state_dict(global_params)
+        _set_client_experts(local_model, client)
         optimizer = opt_fn(local_model, opt_kwargs)
         set_lr(optimizer, lr_r)
 
@@ -529,6 +537,7 @@ def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_
         result = {
             "cid": client.cid,
             "num_samples": client.num_samples,
+            "allowed_experts": client.allowed_experts,
             "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
             "history": hist,
         }
@@ -555,6 +564,7 @@ def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, 
         loader = client.get_loader(in_memory=False)
 
         local_model.load_state_dict(global_params)
+        _set_client_experts(local_model, client)
         optimizer = opt_fn(local_model, opt_kwargs)
         set_lr(optimizer, lr_r)
 
@@ -569,6 +579,7 @@ def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, 
         result = {
             "cid": client.cid,
             "num_samples": client.num_samples,
+            "allowed_experts": client.allowed_experts,
             "state": {k: v.detach().cpu() for k, v in local_model.state_dict().items()},
             "history": hist,
         }
@@ -638,6 +649,17 @@ def fl_loop(clients,model_fn,opt_fn,
     global_params = deepcopy(global_model.state_dict())
     
     collect_expert_stats = getattr(global_model, "collect_expert_stats", False)
+
+    #Context expert FL: each context maps to the expert with the same id, so a client
+    #only dispatches to (and updates) the experts of the contexts present in its data
+    if agg_fn is context_expert_fedadam:
+        num_experts = global_model._moe_modules[0].num_experts
+        for client in clients:
+            assert client.contexts, f"Client {client.cid} has no context labels"
+            assert max(client.contexts) < num_experts, (
+                f"Client {client.cid} has contexts {client.contexts}, but only {num_experts} experts"
+            )
+            client.allowed_experts = list(client.contexts)
     
     if amp_dtype == torch.float16:
         scaler = GradScaler(device=device)
@@ -699,11 +721,16 @@ def fl_loop(clients,model_fn,opt_fn,
         client_metrics = [{"cid": r["cid"], "num_samples": r["num_samples"],
                            "history": r["history"]} for r in results]
         
-        if (agg_fn is expert_weighted_fedadam) or (agg_fn is context_expert_fedadam):
+        if agg_fn is expert_weighted_fedadam:
             client_expert_stats = [r["moe_stats"] for r in results]
             round_agg_fn = partial(agg_fn,global_model=global_model,
                                    server_optimizer=server_optimizer,
                                    moe_stats=client_expert_stats)
+        elif agg_fn is context_expert_fedadam:
+            client_allowed_experts = [set(r["allowed_experts"]) for r in results]
+            round_agg_fn = partial(agg_fn,global_model=global_model,
+                                   server_optimizer=server_optimizer,
+                                   client_allowed_experts=client_allowed_experts)
         elif agg_fn is expert_weighted_fedavg:
             client_expert_stats = [r["moe_stats"] for r in results]
             round_agg_fn = partial(agg_fn, moe_stats=client_expert_stats) 

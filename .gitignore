@@ -216,5 +216,6 @@ figs/*
 *.png
 sweep/*
 runs_atto/*
+.vscode
 
 weather_augmentations/*.npy

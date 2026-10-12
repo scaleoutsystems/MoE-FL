@@ -132,27 +132,25 @@ def _expert_id_of_key(k):
     m = _EXPERT_RE.search(k)
     return int(m.group(1)) if m else None
 
-def context_expert_fedavg(client_states, client_ns, moe_stats, global_params, device="cpu"):
+def context_expert_fedavg(client_states, client_ns, client_allowed_experts, global_params, device="cpu"):
     device = torch.device(device)
-    # one integer per client: which expert it used
-    client_experts = [int(torch.stack(cs).sum(0).argmax()) for cs in moe_stats]
-
     total_n = float(sum(client_ns))
     out = {}
     for k in client_states[0].keys():
         ref = client_states[0][k]
-        e = _expert_id_of_key(k)            # same regex helper as before
+        e = _expert_id_of_key(k)
 
         if e is None:
             members = list(zip(client_states, client_ns))
             denom = total_n
         else:
-            members = [(cs, n) for cs, n, owned
-                       in zip(client_states, client_ns, client_experts) if owned == e]
+            members = [(cs, n) for cs, n, allowed
+                       in zip(client_states, client_ns, client_allowed_experts)
+                       if e in allowed]
             denom = float(sum(n for _, n in members))
 
         if not members or denom == 0.0:
-            out[k] = global_params[k].to(device)     # missing expert -> freeze
+            out[k] = global_params[k].to(device)   # no client trained this expert -> freeze
             continue
 
         acc = torch.zeros_like(ref, device=device, dtype=torch.float32)
@@ -161,20 +159,20 @@ def context_expert_fedavg(client_states, client_ns, moe_stats, global_params, de
         out[k] = acc.to(ref.dtype)
     return out
 
-def context_expert_fedadam(client_states, client_ns, moe_stats, device,
+def context_expert_fedadam(client_states, client_ns, client_allowed_experts, device,
                            global_model, server_optimizer):
     global_params = global_model.state_dict()
-    aggregated = context_expert_fedavg(client_states, client_ns, moe_stats,
+    aggregated = context_expert_fedavg(client_states, client_ns, client_allowed_experts,
                                        global_params, device=device)
 
-    # experts any sampled client used this round
-    used_experts = {int(torch.stack(cs).sum(0).argmax()) for cs in moe_stats}
+    # experts any sampled client was configured to use this round
+    used_experts = {e for allowed in client_allowed_experts for e in allowed}
 
     server_optimizer.zero_grad(set_to_none=True)
     for name, param in global_model.named_parameters():
         e = _expert_id_of_key(name)
         if e is not None and e not in used_experts:
-            param.grad = None                      # skip -> freeze weight AND Adam moments
+            param.grad = None                      # no sampled client could have trained this -> freeze weight AND Adam moments
         else:
             param.grad = param.data - aggregated[name].to(param.device)
     server_optimizer.step()
@@ -335,8 +333,14 @@ class InMemoryDataset(Dataset):
 
 
 class Client:
-    def __init__(self, cid, subset, num_samples, dataset, transform, dl_kwargs, batch_size):
+    def __init__(self, cid, subset, num_samples, dataset, transform, dl_kwargs, batch_size,
+                 contexts=None):
         self.cid = cid
+        #Context labels present in this client's data (e.g. weather indices), None if the
+        #dataset has no contexts. Each context maps directly to the expert with the same id
+        self.contexts = contexts
+        #Experts this client may dispatch to, None means no restriction
+        self.allowed_experts = None
         self.subset = subset
         self.num_samples = num_samples
         self._dataset = dataset
@@ -401,6 +405,12 @@ class Client:
         self._samples = None
 
 
+#Per-sample context label (int), or None if the dataset has no notion of context
+def _sample_contexts(dataset):
+    if isinstance(dataset, WeatherImageNetSubset):
+        return [dataset.weather_types.index(w) for w in dataset.weathers]
+    return None
+
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True, dirichlet_alpha=None):
     n = len(dataset)
@@ -455,6 +465,8 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
             rng.shuffle(indices)
         splits = np.array_split(indices, num_clients)
 
+    sample_contexts = _sample_contexts(dataset)
+
     clients = []
     for cid, idxs in enumerate(splits):
         clients.append(Client(
@@ -465,6 +477,8 @@ def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
             transform=transform,
             dl_kwargs=dl_kwargs,
             batch_size=batch_size,
+            contexts=(sorted({sample_contexts[i] for i in idxs})
+                      if sample_contexts is not None else None),
         ))
 
     return clients

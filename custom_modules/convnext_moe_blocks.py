@@ -92,10 +92,7 @@ def _remap_disallowed_experts(topi, logits, allowed_expert_ids):
 def remap_dispatch_only(topi, weights, priority, logits, allowed_experts):
     """
     Default expert-restriction strategy: reroutes disallowed picks to the
-    best allowed alternative for dispatch only. weights/priority are left
-    untouched, they still reflect the router's original, unrestricted
-    decision, so the gating network's gradient signal is unaffected by
-    which experts happen to be locally available (e.g. a federated client).
+    best allowed alternative for dispatch only. 
     """
     new_topi = _remap_disallowed_experts(topi, logits, allowed_experts)
     return new_topi, weights, priority
@@ -142,7 +139,7 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         self.restriction_fn = restriction_fn
         self.register_buffer('expert_stats', torch.zeros(num_experts), persistent=False)
 
-        #self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
+        self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
 
     #This module may not work well with torch.compile
     @torch.compiler.disable
@@ -184,7 +181,8 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         moe_out = moe_flat.view(N, H, W, C)
         moe_out = self.permute_back(moe_out)  # (N, C, H, W)
         
-        return input + moe_out + x_skip
+        #Layer scale on the whole branch (experts + skip), like CNBlock
+        return input + self.layer_scale * (moe_out + x_skip)
     
 class ConvNeXtExpert(nn.Module):
     def __init__(self, dim, mlp_ratio):

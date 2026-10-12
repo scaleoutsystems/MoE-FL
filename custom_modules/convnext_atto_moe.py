@@ -27,7 +27,7 @@ def inject_moe_into_convnext(
                 top_k=top_k,
                 mlp_ratio=mlp_ratio,
                 capacity_ratio=capacity_ratio,
-                layer_scale=0.0,
+                layer_scale=1e-6,
             )
     return model
 

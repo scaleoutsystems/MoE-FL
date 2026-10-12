@@ -60,7 +60,7 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
     val_loader    = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size,
                                                 sampler=val_sampler,
                                                 num_workers=num_workers,
-                                                **dl_kwargs)
+                                                **{**dl_kwargs, "drop_last": False})
 
     model   = torch.compile(model_fn().to(device))
     model   = DDP(model, device_ids=[rank])
@@ -222,14 +222,17 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
 
             optimizer.zero_grad(set_to_none=True)
 
-            if has_aux:
-                logits, aux = model(x, context=context, return_aux=True)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss + aux
-            else:
-                logits = model(x)
-                base_loss = loss_fn(logits, y)
-                total_loss = base_loss
+            #Tesla T4 uses f16
+            #A100 uses bfloat16
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                if has_aux:
+                    logits, aux = model(x, context=context, return_aux=True)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss + aux
+                else:
+                    logits = model(x)
+                    base_loss = loss_fn(logits, y)
+                    total_loss = base_loss
 
             prox_term = None
             if fedprox and mu > 0.0:
@@ -429,7 +432,8 @@ def _set_client_experts(model, client):
 
 @ray.remote(num_gpus=1)
 class ClientWorker:
-    def __init__(self, model_fn, amp_dtype,seed=42):
+    def __init__(self, model_fn, amp_dtype, dataset, seed=42):
+        self.dataset = dataset  # sent once, clients arrive without it
         self.device = torch.device("cuda:0")  # Ray assigns 1 GPU per actor
         self.model = torch.compile(model_fn().to(self.device))
         self.amp_dtype = amp_dtype
@@ -450,6 +454,7 @@ class ClientWorker:
         optimizer = opt_fn(self.model, opt_kwargs)
         set_lr(optimizer, lr_r)
         snap = [p.to(self.device) for p in snap_cpu] if snap_cpu else None
+        client._dataset = self.dataset
         loader = client.get_loader(in_memory=False)
         _set_client_experts(self.model, client)
 
@@ -483,12 +488,12 @@ def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_
     results = []
     
     global_ref = ray.put(global_params)
-    ray.get([w.set_params.remote(global_ref) for w in workers])
-    del global_ref
     snap_ref = ray.put(snap_cpu)
 
     for batch_start in range(0, len(selected_clients), num_gpus):
         batch = selected_clients[batch_start : batch_start + num_gpus]
+
+        ray.get([workers[rank].set_params.remote(global_ref) for rank in range(len(batch))])
 
         futures = [
             workers[rank].train.remote(
@@ -502,7 +507,7 @@ def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_
         batch_results = ray.get(futures)
         results.extend(batch_results)
     
-    del snap_ref
+    del global_ref, snap_ref
 
     return results
 
@@ -666,25 +671,27 @@ def fl_loop(clients,model_fn,opt_fn,
     else:
         scaler = None
         
-    if num_gpus > 1:
+    def start_workers(r):
         ray.init(include_dashboard=False,logging_level=logging.ERROR)
-        workers = [ClientWorker.remote(model_fn, amp_dtype) for _ in range(num_gpus)]
+        dataset_ref = ray.put(clients[0]._dataset)
+        #Distinct seed per worker and per (re)start, so parallel clients don't share RNG streams
+        workers = [ClientWorker.remote(model_fn, amp_dtype, dataset_ref, seed=r * num_gpus + rank)
+                   for rank in range(num_gpus)]
         print(f"Started {num_gpus} persistent Ray workers")
-    else:
-        workers = None
+        return workers
+
+    workers = start_workers(start_round) if num_gpus > 1 else None
 
     # Federated loop
     for r in range(start_round, num_rounds):
         print(f"\n=== Round {r} ===")
         
         #Restart ray every 100 rounds to avoid performance drift
-        if (r != 0) and (r % 100 == 0) and num_gpus > 1:
+        if (r != start_round) and (r % 100 == 0) and num_gpus > 1:
             print("Restarting ray")
             ray.shutdown()
             time.sleep(1)
-            ray.init(include_dashboard=False,logging_level=logging.ERROR)
-            workers = [ClientWorker.remote(model_fn, amp_dtype) for _ in range(num_gpus)]
-            print(f"Started {num_gpus} persistent Ray workers")
+            workers = start_workers(r)
         
         lr_r = float(lr_sched[r])
         m = int(max(1, math.ceil(client_frac * num_clients)))

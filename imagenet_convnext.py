@@ -68,7 +68,7 @@ dl_kwargs = {
     "drop_last": True,
 }
 
-val_dl_kwargs = {**dl_kwargs, "drop_last": False}
+val_dl_kwargs = {**dl_kwargs, "drop_last": False, "persistent_workers": True}
 
 cfg = {
     "seed": seed,

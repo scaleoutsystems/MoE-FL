@@ -88,8 +88,11 @@ def expert_weighted_fedavg(client_states, client_num_samples, moe_stats, device=
     expert_weights.div_(expert_weights.sum(dim=-1, keepdim=True) + eps)
     
     combined_weights = expert_weights * weights.view(-1, 1, 1)
-    #Renormalize across clients so weights sum to 1 per layer-expert
-    combined_weights.div_(combined_weights.sum(dim=0, keepdim=True) + eps)
+    #Renormalize across clients so weights sum to 1 per layer-expert. If no client
+    #routed any token to an expert, its copies are untouched: fall back to data weights
+    totals = combined_weights.sum(dim=0, keepdim=True)
+    combined_weights = torch.where(totals > 0, combined_weights / (totals + eps),
+                                   weights.view(-1, 1, 1).expand_as(combined_weights))
 
     # Build layer to index mapping for experts
     layer_order = []
@@ -350,6 +353,10 @@ class Client:
         self._samples = None
         self._thread = None
         self._error = None
+
+    #Don't ship the dataset with the client (e.g. to Ray workers), receivers already hold it
+    def __getstate__(self):
+        return {**self.__dict__, "_dataset": None}
 
     def prefetch(self):
         self._samples = None

@@ -2,6 +2,9 @@ import torch
 import math
 import random
 import gc
+import io
+import json
+import contextlib
 import ray
 import time
 import logging
@@ -11,6 +14,7 @@ from functools import partial
 from collections import defaultdict
 from torch.amp import autocast, GradScaler
 from .fl_utils import compute_prox_term, snapshot_params_fp32, set_lr,fedavg, fedadam, expert_weighted_fedadam, expert_weighted_fedavg, context_expert_fedadam
+from .data_utils import ZOD
 from .experiment_tracking import log_and_checkpoint, log_client_metrics, load_checkpoint, log_routing_metrics
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -207,16 +211,19 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
         running_total = torch.zeros((), device=device)
         correct = torch.zeros((), device=device, dtype=torch.long)
         total   = torch.zeros((), device=device, dtype=torch.long)
+        running_terms = defaultdict(lambda: torch.zeros((), device=device))  # detection loss terms
 
         for batch in loader:
-            if len(batch) == 3:
-                x, y, context = batch
-                context = context.to(device, non_blocking=True)
+            x, y = batch[0], batch[1]
+            context = batch[2].to(device, non_blocking=True) if len(batch) == 3 else None
+            #Detection (ZOD) batches are lists of images and target dicts
+            detection = isinstance(y, list)
+            if detection:
+                x = [img.to(device, non_blocking=True) for img in x]
+                y = [{k: v.to(device, non_blocking=True) for k, v in t.items() if torch.is_tensor(v)} for t in y]
             else:
-                x, y = batch
-                context = None
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
 
             if mix_transform is not None:
                 x, y = mix_transform(x, y)
@@ -226,14 +233,14 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
             #Tesla T4 uses f16
             #A100 uses bfloat16
             with autocast(device_type="cuda", dtype=amp_dtype):
+                inputs = (x, y) if detection else (x,)
                 if has_aux:
-                    logits, aux = model(x, context=context, return_aux=True)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss + aux
+                    out, aux = model(*inputs, context=context, return_aux=True)
                 else:
-                    logits = model(x)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss
+                    out = model(*inputs)
+                #Detection models return their loss dict, classification models their logits
+                base_loss = sum(out.values()) if detection else loss_fn(out, y)
+                total_loss = base_loss + aux if has_aux else base_loss
 
             prox_term = None
             if fedprox and mu > 0.0:
@@ -248,7 +255,7 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 scaler.step(optimizer)
                 scaler.update()
 
-            bs = x.size(0)
+            bs = len(x) if detection else x.size(0)
             running_base  += base_loss.detach() * bs
             running_total += total_loss.detach() * bs
             if has_aux:
@@ -256,22 +263,29 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
             if fedprox and mu > 0:
                running_prox += prox_term.detach() * bs
 
-            # accuracy (handles MixUp/CutMix soft labels)
-            y_hard = y.argmax(dim=1) if y.ndim == 2 else y
-            correct += (logits.argmax(dim=1) == y_hard).sum()
+            if detection:
+                for k, v in out.items():
+                    running_terms[k] += v.detach() * bs
+            else:
+                # accuracy (handles MixUp/CutMix soft labels)
+                y_hard = y.argmax(dim=1) if y.ndim == 2 else y
+                correct += (out.argmax(dim=1) == y_hard).sum()
             total += bs
 
         epoch_base  = (running_base / total).item()
         epoch_total = (running_total / total).item()
-        epoch_acc   = (correct / total).item()
+        epoch_acc   = None if detection else (correct / total).item()
         epoch_aux   = (running_aux / total).item() if has_aux else None
         epoch_prox  = (running_prox / total).item() if (fedprox and mu > 0.0) else None
 
         m = {
             "epoch": epoch + 1,
             "total_loss": epoch_total,
-            "acc": epoch_acc,
         }
+        if detection:
+            m.update({k: (v / total).item() for k, v in running_terms.items()})
+        else:
+            m["acc"] = epoch_acc
         
         if has_aux:
             m["aux_loss"] = epoch_aux
@@ -297,9 +311,10 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 parts.append(f"Prox loss: {epoch_prox:.6f}")
                 parts.append(f'Prox percentage: {epoch_prox/epoch_total:.4f}')
 
-            # Always show total + acc
+            # Always show total (+ acc for classification)
             parts.append(f"total loss: {epoch_total:.4f}")
-            parts.append(f"acc: {epoch_acc:.4f}")
+            if not detection:
+                parts.append(f"acc: {epoch_acc:.4f}")
             print(" - ".join(parts))
 
     return history
@@ -367,6 +382,76 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
         }
         
     return result
+
+@torch.no_grad()
+def evaluate_zod(model, loader, device):
+    """COCO box AP on a ZOD split, as in the ZOD paper (crowd boxes are ignore regions, size
+    buckets in original pixels): overall, per class and per road type, in percent."""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+    quiet = lambda: contextlib.redirect_stdout(io.StringIO())  # pycocotools prints a lot
+    dataset = loader.dataset
+    with quiet():
+        gt = COCO(dataset.coco_json)
+        #COCOeval treats annotation id 0 as "unmatched", and the devkit gives frame 0's first object id 0
+        for a in gt.dataset["annotations"]:
+            a["id"] += 1
+        gt.createIndex()
+    name_to_cat = {c["name"]: c["id"] for c in gt.dataset["categories"]}
+
+    model.eval()
+    results = []
+    for images, targets, _ in loader:
+        outputs = model([img.to(device, non_blocking=True) for img in images])
+        for img, target, out in zip(images, targets, outputs):
+            #Predictions are in the loaded image's pixels, ground truth in original pixels
+            info = gt.imgs[target["image_id"]]
+            boxes = out["boxes"].cpu() * torch.tensor([info["width"] / img.shape[-1], info["height"] / img.shape[-2]] * 2)
+            boxes[:, 2:] -= boxes[:, :2]  # xyxy -> xywh
+            results += [{"image_id": target["image_id"], "category_id": name_to_cat[ZOD.classes[label - 1]],
+                         "bbox": box, "score": score}
+                        for box, label, score in zip(boxes.tolist(), out["labels"].tolist(), out["scores"].tolist())]
+    if not results:
+        return {"AP": 0.0}
+
+    with quiet():
+        dt = gt.loadRes(results)
+    def coco_eval(img_ids):
+        E = COCOeval(gt, dt, "bbox")
+        E.params.imgIds = img_ids
+        with quiet():
+            E.evaluate(); E.accumulate(); E.summarize()
+        return E
+
+    pct = lambda v: 100 * float(v) if v >= 0 else float("nan")  # COCOeval gives -1 when there is no ground truth
+    E = coco_eval([img["id"] for img in dataset.images])
+    metrics = dict(zip(["AP", "AP50", "AP75", "APs", "APm", "APl"], map(pct, E.stats[:6])))
+    #precision: [IoU threshold, recall, class, area range, max dets], area "all", 100 dets
+    for k, cat_id in enumerate(E.params.catIds):
+        p = E.eval["precision"][:, :, k, 0, -1]
+        metrics[f"AP/{gt.cats[cat_id]['name']}"] = 100 * float(p[p > -1].mean()) if (p > -1).any() else float("nan")
+    for ctx, road_type in enumerate(ZOD.road_types):
+        ids = [img["id"] for img, c in zip(dataset.images, dataset.contexts) if c == ctx]
+        if ids:
+            E = coco_eval(ids)
+            metrics[f"AP/{road_type}"], metrics[f"AP50/{road_type}"] = pct(E.stats[0]), pct(E.stats[1])
+    return metrics
+
+def zod_context_counts(dataset):
+    """Per road type: frames, boxes per class and per COCO size bucket (original pixels, crowd boxes excluded)."""
+    with open(dataset.coco_json) as f:
+        coco = json.load(f)
+    cat_names = {c["id"]: c["name"] for c in coco["categories"]}
+    road_type_of = {img["id"]: ZOD.road_types[c] for img, c in zip(dataset.images, dataset.contexts)}
+    counts = {rt: defaultdict(int) for rt in ZOD.road_types}
+    for rt in road_type_of.values():
+        counts[rt]["frames"] += 1
+    for a in coco["annotations"]:
+        if not a["iscrowd"]:
+            c = counts[road_type_of[a["image_id"]]]
+            c[cat_names[a["category_id"]]] += 1
+            c["small" if a["area"] < 32 ** 2 else "medium" if a["area"] < 96 ** 2 else "large"] += 1
+    return {rt: dict(c) for rt, c in counts.items()}
 
 @torch.no_grad()
 def compute_routing_metrics(round_idx, routing_model, global_params,
@@ -655,6 +740,7 @@ def fl_loop(clients,model_fn,opt_fn,
     global_params = deepcopy(global_model.state_dict())
     
     collect_expert_stats = getattr(global_model, "collect_expert_stats", False)
+    zod = isinstance(val_loader.dataset, ZOD)
 
     #Context expert FL: each context maps to the expert with the same id, so a client
     #only dispatches to (and updates) the experts of the contexts present in its data
@@ -754,24 +840,28 @@ def fl_loop(clients,model_fn,opt_fn,
         global_model.load_state_dict(global_params)
             
         if (r % eval_every) == 0 or (r == num_rounds-1):
-            va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+            if zod:
+                metrics = {"lr": lr_r, **evaluate_zod(global_model, val_loader, device)}
+                best_key = "AP"
+                print(f"[Server Eval] AP {metrics['AP']:.2f} AP50 {metrics.get('AP50', 0.0):.2f}")
+            else:
+                va = evaluate(global_model, val_loader, device, loss_fn=eval_loss_fn)
+                metrics = {
+                    "lr": lr_r,
+                    "val_loss": float(va["loss"]),
+                    "val_acc": float(va["acc"]),
+                }
+                best_key = "val_acc"
+                print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f}")
 
-            print(f"[Server Eval] val loss {va['loss']:.4f} acc {va['acc']:.4f}")
-            
-            metrics = {
-                "lr": lr_r,
-                "val_loss": float(va["loss"]),
-                "val_acc": float(va["acc"]),
-            }
-            
             saved = log_and_checkpoint(ctx,r,metrics,global_model,
-                           ema_model=None, best_key="val_acc", mode="max",
+                           ema_model=None, best_key=best_key, mode="max",
                            server_optimizer=server_optimizer)
 
             if saved:
-                print(f"New best at round {r}: {metrics['val_acc']:.4f}")
-        # Routing analysis 
-        if collect_expert_stats and (r % (eval_every * 2) == 0 or (r == num_rounds - 1)):
+                print(f"New best at round {r}: {metrics[best_key]:.4f}")
+        # Routing analysis (classification only)
+        if collect_expert_stats and not zod and (r % (eval_every * 2) == 0 or (r == num_rounds - 1)):
             if routing_model is None:
                 routing_model = torch.compile(model_fn().to(device))
             routing_metrics = compute_routing_metrics(

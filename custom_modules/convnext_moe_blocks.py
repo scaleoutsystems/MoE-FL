@@ -26,14 +26,15 @@ class MoEConvNeXtWrapper(nn.Module):
         for m in self._moe_modules:
             m.allowed_experts = allowed_experts
 
-    def forward(self, x, context=None, return_aux: bool = False):
+    #inputs are passed through to base: x for classification, (images, targets) for detection
+    def forward(self, *inputs, context=None, return_aux: bool = False):
         if context is not None:
             self._set_context(context)
-        logits = self.base(x)
+        out = self.base(*inputs)
         self._set_context(None)  # don't let stale context leak into the next call
         if not return_aux:
-            return logits
-        return logits, self.get_aux_loss()
+            return out
+        return out, self.get_aux_loss()
 
     #To make torch.compile not cause recompiles
     @torch.compiler.disable
@@ -128,6 +129,7 @@ class MoECNBlock(nn.Module, PatchDispatcher):
             self.router = ContextRouterLogitCE(dim,num_experts,top_k) 
         else:
             self.router = NoisyTopKRouter(dim, num_experts, top_k)
+        self.context_aware = context_aware
         self._context = None
         self.experts = nn.ModuleList([ConvNeXtExpert(dim, mlp_ratio) for _ in range(num_experts)])
         self.permute_back = Permute([0, 3, 1, 2])
@@ -149,7 +151,8 @@ class MoECNBlock(nn.Module, PatchDispatcher):
         x_flat = x.reshape(-1, C)  # [T, C]
         
         context_tok = None
-        if self._context is not None:
+        #Only the context router uses labels, others ignore any context they are given
+        if self._context is not None and self.context_aware:
             # (N,) -> (T,): each image's context label repeated over its H*W patches
             context_tok = self._context.to(x_flat.device).repeat_interleave(H * W)
 

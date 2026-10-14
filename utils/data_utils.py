@@ -110,6 +110,7 @@ class ZOD(Dataset):
 
     def __init__(self, coco_json, dataset_root, train=False, short_side=800, max_size=1333,
                  version="full"):
+        self.coco_json = coco_json  # ground truth for evaluate_zod
         with open(coco_json) as f:
             coco = json.load(f)
         cat_to_label = {c["id"]: self.classes.index(c["name"]) + 1 for c in coco["categories"]}

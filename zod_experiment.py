@@ -13,10 +13,11 @@ from utils.experiment_tracking import init_run
 from utils.data_utils import ZOD
 from custom_modules.convnext_detection import convnext_detector_fn, convnext_moe_detector_fn
 
-#Runs from NOTES.md: --setting fl --method {D,S,A,B} --c {2,5}, --setting centralized --method {D,S,A}
+#Runs from NOTES.md: --setting fl --method {dense,moe,context_aware,context_distributed} --c {2,5},
+#--setting centralized --method {dense,moe,context_aware}
 parser = argparse.ArgumentParser()
 parser.add_argument("--setting", choices=["fl", "centralized"], required=True)
-parser.add_argument("--method", choices=["D", "S", "A", "B"], required=True)
+parser.add_argument("--method", choices=["dense", "moe", "context_aware", "context_distributed"], required=True)
 parser.add_argument("--c", type=int, choices=[2, 3, 5], default=2, help="contexts per client (fl only)")
 #Pilot values (marked (pilot) in NOTES.md)
 parser.add_argument("--lr", type=float, default=None)
@@ -26,8 +27,8 @@ parser.add_argument("--batch-size", type=int, default=8)
 parser.add_argument("--ckpt", default=None, help="run dir to resume from")
 parser.add_argument("--benchmark", action="store_true", help="pilot step 1: memory and images/s per batch size")
 args = parser.parse_args()
-assert not (args.method == "B" and args.setting == "centralized"), "B has no centralized version"
-assert not (args.method == "B" and args.c == 5), "B equals A at c = 5"
+assert not (args.method == "context_distributed" and args.setting == "centralized"), "context_distributed has no centralized version"
+assert not (args.method == "context_distributed" and args.c == 5), "context_distributed equals context_aware at c = 5"
 
 #Paths (devkit COCO export, see NOTES.md step 0; file names depend on the devkit's Python version)
 ZOD_ROOT   = "/project/home/p201222/zod"
@@ -50,14 +51,16 @@ num_rounds = args.rounds
 server_lr = 5e-3
 server_betas = (0.9, 0.99)
 server_eps = 1e-5
-base_lr = args.lr if args.lr is not None else 0.01
+#0.07 at batch 64 in the ImageNet-100 FL runs, linearly scaled (also Faster R-CNN's 0.02 at batch 16)
+base_lr = args.lr if args.lr is not None else 0.07 * batch_size / 64
 start_lr = base_lr / 10
 end_lr = 1e-6
-warmup_rounds = 5
+warmup_rounds = num_rounds // 10  # 10%, as in the ImageNet-100 FL runs
 
 #Centralized
 num_epochs = args.epochs
-central_lr = args.lr if args.lr is not None else 1e-4
+#ConvNeXt detection recipe: 2e-4 at batch 16, linearly scaled to batch_size per GPU x 4 GPUs
+central_lr = args.lr if args.lr is not None else 2e-4 * (batch_size * 4) / 16
 weight_decay = 0.05
 warmup_epochs = 1
 
@@ -66,8 +69,8 @@ num_experts = len(ZOD.road_types)
 top_k = 1
 mlp_ratio = 2
 capacity_ratio = 1.0
-bpr = args.method == "S"
-context_aware = args.method in ("A", "B")
+bpr = args.method == "moe"
+context_aware = args.method in ("context_aware", "context_distributed")
 
 if args.setting == "fl":
     opt_kwargs = {"lr": base_lr, "momentum": 0.9, "weight_decay": 0.0, "nesterov": True}
@@ -89,7 +92,7 @@ cfg = {
     "method": args.method,
     "contexts_per_client": args.c if args.setting == "fl" else None,
     "fed": {
-        "agg": "context_expert_fedadam" if args.method == "B" else "fedadam",
+        "agg": "context_expert_fedadam" if args.method == "context_distributed" else "fedadam",
         "server_lr": server_lr,
         "server_betas": server_betas,
         "server_eps": server_eps,
@@ -125,7 +128,7 @@ cfg = {
     "model": {
         "detector": "faster_rcnn_fpn_p2-p6",
         "backbone": "convnext_tiny_scratch",
-        "moe": None if args.method == "D" else {
+        "moe": None if args.method == "dense" else {
             "routing": "context_logit_ce" if context_aware else "noisy_top_k",
             "expert_placement": "last block of stages 3 and 4",
             "num_experts": num_experts,
@@ -150,7 +153,7 @@ def opt_fn(model, opt_kwargs):
     return torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
 def model_fn():
-    if args.method == "D":
+    if args.method == "dense":
         return convnext_detector_fn(num_classes=len(ZOD.classes) + 1)
     return convnext_moe_detector_fn(num_experts, top_k, mlp_ratio, capacity_ratio,
                                     num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware)
@@ -214,7 +217,7 @@ if __name__ == "__main__":
                 opt_kwargs=opt_kwargs,
                 num_gpus=4,
                 eval_every=5,
-                agg_fn=context_expert_fedadam if args.method == "B" else fedadam,
+                agg_fn=context_expert_fedadam if args.method == "context_distributed" else fedadam,
                 ckpt_path=args.ckpt)
     else:
         train_centralized_ddp(

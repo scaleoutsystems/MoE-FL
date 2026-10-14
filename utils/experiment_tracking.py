@@ -1,4 +1,5 @@
-import json, time, datetime, os
+import json, time, datetime, os, random
+import numpy as np
 import torch
 from pathlib import Path
 
@@ -64,6 +65,25 @@ def get_uncompiled_state_dict(model):
     return m.state_dict()
 
 
+#RNG state so a resumed run continues the same client sampling / mixup sequence.
+#numpy keys stored as a list since torch.load(weights_only=True) rejects ndarrays
+def _get_rng_state():
+    np_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": (np_state[0], np_state[1].tolist(), *np_state[2:]),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+def _set_rng_state(state):
+    random.setstate(state["python"])
+    np_state = state["numpy"]
+    np.random.set_state((np_state[0], np.array(np_state[1], dtype=np.uint32), *np_state[2:]))
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
 def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None, server_optimizer=None):
     payload = {
         "round": int(round_idx),
@@ -71,6 +91,7 @@ def save_checkpoint(ctx, round_idx, global_model, ema_model, metrics=None, serve
         "ema_model": get_uncompiled_state_dict(ema_model) if ema_model is not None else None,
         "metrics": metrics or {},
         "server_optimizer": server_optimizer.state_dict() if server_optimizer is not None else None,
+        "rng": _get_rng_state(),
     }
 
     ckpt_path = ctx["ckpt_dir"] / "last.pt"
@@ -148,6 +169,8 @@ def load_checkpoint(run_path, global_model, ema_model, server_optimizer=None, ma
         ema_model.load_state_dict(ckpt["ema_model"])
     if server_optimizer is not None and ckpt.get("server_optimizer") is not None:
         server_optimizer.load_state_dict(ckpt["server_optimizer"])
+    if ckpt.get("rng") is not None:
+        _set_rng_state(ckpt["rng"])
 
     best_ckpt_path = run_path / "checkpoints" / "best.pt"
     if best_ckpt_path.exists():

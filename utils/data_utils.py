@@ -1,6 +1,11 @@
 import os
+import json
+from collections import defaultdict
+import torch
+from PIL import Image
 from torchvision.datasets import ImageNet
-from torch.utils.data import Subset
+from torch.utils.data import Dataset, Subset
+import torchvision.transforms.functional as TF
 
 SUBSET_CLASSES = [
     # Animals
@@ -88,3 +93,81 @@ class WeatherImageNetSubset(ImageNetSubset):
             return img, label
         weather = self.weather_types.index(self.weathers[idx])
         return img, label, weather
+
+class ZOD(Dataset):
+    """ZOD Frames 2D detection from the devkit COCO export, with the road type as context.
+
+    Returns (image, target, context): image is a float tensor at short side `short_side`
+    (long side capped at `max_size`), target holds boxes (xyxy, in that image's pixels),
+    labels and the COCO image id. Crowd ("Unclear") boxes are left out, they are only
+    ignore regions for evaluation against the original COCO JSON.
+    """
+
+    #Context index = position in this list = expert id 
+    road_types = ["city", "arterial-urban", "highway", "arterial-rural", "smaller-rural"]
+    #Detection label = position + 1, 0 is background
+    classes = ["Vehicle", "VulnerableVehicle", "Pedestrian"]
+
+    def __init__(self, coco_json, dataset_root, train=False, short_side=800, max_size=1333,
+                 version="full"):
+        with open(coco_json) as f:
+            coco = json.load(f)
+        cat_to_label = {c["id"]: self.classes.index(c["name"]) + 1 for c in coco["categories"]}
+
+        self.images = coco["images"]
+        boxes = defaultdict(list)
+        for a in coco["annotations"]:
+            x, y, w, h = a["bbox"]
+            if not a["iscrowd"] and w > 0 and h > 0:  # degenerate boxes crash Faster R-CNN
+                boxes[a["image_id"]].append((x, y, x + w, y + h, cat_to_label[a["category_id"]]))
+        self.boxes = [boxes[img["id"]] for img in self.images]
+        self.contexts = self._load_road_types(dataset_root, [img["id"] for img in self.images], version)
+
+        self.train = train
+        self.short_side = short_side
+        self.max_size = max_size
+
+    def _load_road_types(self, dataset_root, frame_ids, version):
+        #Imported here so classification runs don't need the zod devkit
+        from zod import ZodFrames
+        zod_frames = ZodFrames(dataset_root, version)
+        contexts = []
+        for frame_id in frame_ids:
+            road_type = zod_frames[frame_id].metadata.road_type.lower().replace("_", "-").replace(" ", "-")
+            if road_type not in self.road_types:
+                raise ValueError(f"Frame {frame_id}: unknown road type {road_type!r}, expected one of {self.road_types}")
+            contexts.append(self.road_types.index(road_type))
+        return contexts
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        info = self.images[idx]
+        w, h = info["width"], info["height"]
+        scale = min(self.short_side / min(w, h), self.max_size / max(w, h))
+        new_w, new_h = round(w * scale), round(h * scale)
+
+        img = Image.open(info["file_name"])
+        #Let the JPEG decoder skip work: decodes at the smallest of 1/2, 1/4, 1/8 scale
+        #that is still >= the target size, then resize the rest of the way on the CPU
+        img.draft("RGB", (new_w, new_h))
+        img = img.convert("RGB").resize((new_w, new_h), Image.BILINEAR)
+        image = TF.to_tensor(img)
+
+        boxes = torch.tensor([b[:4] for b in self.boxes[idx]], dtype=torch.float32).reshape(-1, 4)
+        boxes *= torch.tensor([new_w / w, new_h / h, new_w / w, new_h / h])
+        labels = torch.tensor([b[4] for b in self.boxes[idx]], dtype=torch.int64)
+
+        if self.train and torch.rand(()) < 0.5:
+            image = image.flip(-1)
+            boxes[:, [0, 2]] = new_w - boxes[:, [2, 0]]
+
+        target = {"boxes": boxes, "labels": labels, "image_id": info["id"]}
+        return image, target, self.contexts[idx]
+
+    #DataLoader collate_fn: detection batches are lists, images differ in size after augmentation
+    @staticmethod
+    def collate(batch):
+        images, targets, contexts = zip(*batch)
+        return list(images), list(targets), torch.tensor(contexts)

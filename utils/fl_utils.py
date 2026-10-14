@@ -2,9 +2,10 @@ import torch
 import threading
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
-from .data_utils import WeatherImageNetSubset
+from .data_utils import WeatherImageNetSubset, ZOD
 import ctypes
 from collections import defaultdict
+from itertools import combinations
 import re
 
 #We have to force free the RAM
@@ -359,6 +360,7 @@ class Client:
         return {**self.__dict__, "_dataset": None}
 
     def prefetch(self):
+        assert hasattr(self._dataset, "imgs"), "In-memory prefetch (io_bottleneck) only supports ImageFolder-style datasets"
         self._samples = None
         self._error = None
 
@@ -417,6 +419,32 @@ def _sample_contexts(dataset):
     if isinstance(dataset, WeatherImageNetSubset):
         return [dataset.weather_types.index(w) for w in dataset.weathers]
     return None
+
+def init_clients_zod(dataset, c, num_clients, batch_size, dl_kwargs, seed=42):
+    """ZOD clients holding c road types each. Every combination of c road types is given to
+    the same number of clients, and each road type's frames are split evenly at random among
+    the clients holding it, so every frame is used exactly once."""
+    assert isinstance(dataset, ZOD)
+    num_contexts = len(dataset.road_types)
+    combos = list(combinations(range(num_contexts), c))
+    assert num_clients % len(combos) == 0, (
+        f"{num_clients} clients can't be split evenly over {len(combos)} combinations of {c} contexts"
+    )
+    client_contexts = [combo for combo in combos for _ in range(num_clients // len(combos))]
+
+    frame_contexts = np.array(dataset.contexts)
+    rng = np.random.default_rng(seed)
+    splits = [[] for _ in range(num_clients)]
+    for ctx in range(num_contexts):
+        holders = [cid for cid, combo in enumerate(client_contexts) if ctx in combo]
+        idxs = rng.permutation(np.flatnonzero(frame_contexts == ctx))
+        for cid, chunk in zip(holders, np.array_split(idxs, len(holders))):
+            splits[cid].extend(chunk.tolist())
+
+    dl_kwargs = {**dl_kwargs, "collate_fn": ZOD.collate}
+    return [Client(cid=cid, subset=idxs, num_samples=len(idxs), dataset=dataset, transform=None,
+                   dl_kwargs=dl_kwargs, batch_size=batch_size, contexts=list(client_contexts[cid]))
+            for cid, idxs in enumerate(splits)]
 
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True, dirichlet_alpha=None):

@@ -72,7 +72,8 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
     scheduler = scheduler_fn(optimizer)
 
     if ckpt_path is not None:
-        start_epoch, ctx, model, _, optimizer = load_checkpoint(ckpt_path, model, None, optimizer)
+        #Checkpoint keys are unprefixed (saved from model.module._orig_mod), so load into that
+        start_epoch, ctx, _, _, optimizer = load_checkpoint(ckpt_path, model.module._orig_mod, None, optimizer)
         scheduler = scheduler_fn(optimizer)
         for _ in range(start_epoch):
             scheduler.step()

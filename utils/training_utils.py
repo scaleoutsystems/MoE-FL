@@ -10,6 +10,7 @@ import time
 import logging
 import numpy as np
 from copy import deepcopy
+from datetime import timedelta
 from functools import partial
 from collections import defaultdict
 from torch.amp import autocast, GradScaler
@@ -20,6 +21,17 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from timm.data import Mixup
+from torchvision.models.detection.generalized_rcnn import GeneralizedRCNN
+
+def compile_model(model):
+    """torch.compile for classification models. For detectors only the backbone (ConvNeXt + FPN)
+    is compiled, in place so parameter names stay the same: the detection heads have
+    data-dependent shapes (proposals, NMS) that would keep breaking the graph."""
+    detector = getattr(model, "base", model)  # MoE models are wrapped
+    if isinstance(detector, GeneralizedRCNN):
+        detector.backbone.compile()
+        return model
+    return torch.compile(model)
 
 class ContextMixup(Mixup):
 
@@ -48,13 +60,17 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
                           amp_dtype=torch.bfloat16, ckpt_path=None,
                           batch_size=512, num_workers=4, **dl_kwargs):
 
-    dist.init_process_group(backend="nccl")
+    #Long timeout: for ZOD, rank 0 evaluates the full val set while the others wait
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=1))
     rank       = dist.get_rank()
     world_size = dist.get_world_size()
     device     = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     is_master  = rank == 0
 
+    zod = isinstance(dataset, ZOD)
+    if zod:
+        dl_kwargs = {**dl_kwargs, "collate_fn": ZOD.collate}
     train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler   = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     train_loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
@@ -66,18 +82,18 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
                                                 num_workers=num_workers,
                                                 **{**dl_kwargs, "drop_last": False})
 
-    model   = torch.compile(model_fn().to(device))
-    model   = DDP(model, device_ids=[rank])
+    model   = compile_model(model_fn().to(device))
+    #Experts that get no tokens in a batch (non-BPR routing) have no gradient
+    model   = DDP(model, device_ids=[rank], find_unused_parameters=hasattr(model, "get_aux_loss"))
     scaler  = GradScaler(device=device) if amp_dtype == torch.float16 else None
-    has_aux = hasattr(model.module, "get_aux_loss")
     collect_expert_stats = getattr(model.module, "collect_expert_stats", False)
 
     optimizer = opt_fn(model, opt_kwargs)
     scheduler = scheduler_fn(optimizer)
 
     if ckpt_path is not None:
-        #Checkpoint keys are unprefixed (saved from model.module._orig_mod), so load into that
-        start_epoch, ctx, _, _, optimizer = load_checkpoint(ckpt_path, model.module._orig_mod, None, optimizer)
+        #Checkpoint keys are unprefixed (saved without the torch.compile wrapper), so load into that
+        start_epoch, ctx, _, _, optimizer = load_checkpoint(ckpt_path, getattr(model.module, "_orig_mod", model.module), None, optimizer)
         scheduler = scheduler_fn(optimizer)
         for _ in range(start_epoch):
             scheduler.step()
@@ -89,72 +105,33 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
 
         if is_master:
             print(f"\n=== Epoch {epoch} ===")
-        model.train()
 
-        running_base  = torch.zeros((), device=device)
-        running_aux   = torch.zeros((), device=device)
-        running_total = torch.zeros((), device=device)
-        correct = torch.zeros((), device=device, dtype=torch.long)
-        total   = torch.zeros((), device=device, dtype=torch.long)
-
-        for x, y in train_loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            if mix_transform is not None:
-                x, y = mix_transform(x, y)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with autocast(device_type="cuda", dtype=amp_dtype):
-                if has_aux:
-                    logits, aux = model(x, return_aux=True)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss + aux
-                else:
-                    logits = model(x)
-                    base_loss = loss_fn(logits, y)
-                    total_loss = base_loss
-
-            if scaler is None:
-                total_loss.backward()
-                optimizer.step()
-            else:
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-            bs = x.size(0)
-            running_total += total_loss.detach() * bs
-            running_base  += base_loss.detach() * bs
-            if has_aux:
-                running_aux += aux.detach() * bs
-            y_hard = y.argmax(dim=1) if y.ndim == 2 else y
-            correct += (logits.argmax(dim=1) == y_hard).sum()
-            total   += bs
-
+        hist = train_client(model, train_loader, device, optimizer, loss_fn, scaler, amp_dtype,
+                            num_epochs=1, log=False, mix_transform=mix_transform)[0]
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
-        for t in [running_total, running_base, running_aux, correct, total]:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
+        #Average the per-rank epoch metrics (DistributedSampler gives equal-sized shards)
+        keys = sorted(k for k in hist if k != "epoch")
+        means = torch.tensor([hist[k] for k in keys], device=device)
+        dist.all_reduce(means, op=dist.ReduceOp.SUM)
         if is_master:
-            epoch_total = (running_total / total).item()
-            epoch_acc   = (correct / total).item()
-            epoch_base  = (running_base / total).item()
-            epoch_aux   = (running_aux / total).item() if has_aux else None
+            parts = [f"Epoch [{epoch+1}/{num_epochs}]"] + [f"{k}: {v / world_size:.4f}" for k, v in zip(keys, means.tolist())]
+            print(" - ".join(parts + [f"lr: {lr:.6f}"]))
 
-            parts = [f"Epoch [{epoch+1}/{num_epochs}]"]
-            if has_aux:
-                parts.append(f"base loss: {epoch_base:.4f}")
-                parts.append(f"aux loss: {epoch_aux:.6f}")
-            parts.append(f"total loss: {epoch_total:.4f}")
-            parts.append(f"acc: {epoch_acc:.4f}")
-            parts.append(f"lr: {lr:.6f}")
-            print(" - ".join(parts))
+        if zod and ((epoch % eval_every) == 0 or (epoch == num_epochs - 1)):
+            #COCOeval needs all predictions in one place: rank 0 evaluates the full val set
+            if is_master:
+                full_val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                                              num_workers=num_workers, collate_fn=ZOD.collate)
+                metrics = {"lr": lr, **evaluate_zod(model.module, full_val_loader, device)}
+                print(f"[Eval] AP {metrics['AP']:.2f} AP50 {metrics.get('AP50', 0.0):.2f}")
+                if log_and_checkpoint(ctx, epoch, metrics, model.module, ema_model=None, best_key="AP",
+                                      mode="max", server_optimizer=optimizer):
+                    print(f"New best at epoch {epoch}: {metrics['AP']:.2f}")
+            dist.barrier()
 
-        if (epoch % eval_every) == 0 or (epoch == num_epochs - 1):
+        elif (epoch % eval_every) == 0 or (epoch == num_epochs - 1):
             va = evaluate(model.module, val_loader, device, loss_fn=eval_loss_fn)
 
             val_loss_t = torch.tensor(va["loss"], device=device)
@@ -202,7 +179,7 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
     model.train()
     history = []
 
-    has_aux = hasattr(model, "get_aux_loss")
+    has_aux = hasattr(getattr(model, "module", model), "get_aux_loss")  # DDP wraps the model
 
     for epoch in range(num_epochs):
         running_base  = torch.zeros((), device=device)
@@ -411,8 +388,9 @@ def evaluate_zod(model, loader, device):
             results += [{"image_id": target["image_id"], "category_id": name_to_cat[ZOD.classes[label - 1]],
                          "bbox": box, "score": score}
                         for box, label, score in zip(boxes.tolist(), out["labels"].tolist(), out["scores"].tolist())]
-    if not results:
-        return {"AP": 0.0}
+    if not results:  # no detections at all (e.g. early rounds): every AP is 0, same keys as below
+        keys = ["AP", "AP50", "AP75", "APs", "APm", "APl"] + [f"AP/{c}" for c in ZOD.classes]
+        return dict.fromkeys(keys + [f"{m}/{rt}" for rt in ZOD.road_types for m in ("AP", "AP50")], 0.0)
 
     with quiet():
         dt = gt.loadRes(results)
@@ -521,7 +499,7 @@ class ClientWorker:
     def __init__(self, model_fn, amp_dtype, dataset, seed=42):
         self.dataset = dataset  # sent once, clients arrive without it
         self.device = torch.device("cuda:0")  # Ray assigns 1 GPU per actor
-        self.model = torch.compile(model_fn().to(self.device))
+        self.model = compile_model(model_fn().to(self.device))
         self.amp_dtype = amp_dtype
         self.scaler = GradScaler(device=self.device) if amp_dtype == torch.float16 else None
         random.seed(seed)
@@ -723,7 +701,7 @@ def fl_loop(clients,model_fn,opt_fn,
     
     if ckpt_path is not None:
         start_round, ctx, global_model, _, server_optimizer = load_checkpoint(ckpt_path,global_model,None,server_optimizer)
-        global_model = torch.compile(global_model).to(device)
+        global_model = compile_model(global_model).to(device)
         if server_optimizer is not None:
             for state in server_optimizer.state.values():
                 for k, v in state.items():
@@ -731,10 +709,10 @@ def fl_loop(clients,model_fn,opt_fn,
                         state[k] = v.to(device)
     else:
         start_round = 0
-        global_model = torch.compile(global_model).to(device)
+        global_model = compile_model(global_model).to(device)
     
     if num_gpus == 1:
-        local_model = torch.compile(model_fn().to(device))
+        local_model = compile_model(model_fn().to(device))
     else:
         local_model = None
     global_params = deepcopy(global_model.state_dict())
@@ -863,7 +841,7 @@ def fl_loop(clients,model_fn,opt_fn,
         # Routing analysis (classification only)
         if collect_expert_stats and not zod and (r % (eval_every * 2) == 0 or (r == num_rounds - 1)):
             if routing_model is None:
-                routing_model = torch.compile(model_fn().to(device))
+                routing_model = compile_model(model_fn().to(device))
             routing_metrics = compute_routing_metrics(
                 round_idx=r,
                 routing_model=routing_model,

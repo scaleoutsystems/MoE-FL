@@ -2,23 +2,23 @@ import os
 import time
 import random
 import argparse
+from collections import Counter
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Subset
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 
-from utils.fl_utils import init_clients_zod, lr_schedule, fedadam, context_expert_fedadam
+from utils.fl_utils import init_clients_zod, fedadam, context_expert_fedadam
 from utils.training_utils import fl_loop, train_centralized_ddp, train_client, compile_model, zod_context_counts
 from utils.experiment_tracking import init_run
 from utils.data_utils import ZOD
 from custom_modules.convnext_detection import convnext_detector_fn, convnext_moe_detector_fn
 
-#Runs from NOTES.md: --setting fl --method {dense,moe,context_aware,context_distributed} --c {2,5},
+#Runs from NOTES.md: --setting fl --method {dense,moe,context_aware,context_distributed},
 #--setting centralized --method {dense,moe,context_aware}
 parser = argparse.ArgumentParser()
 parser.add_argument("--setting", choices=["fl", "centralized"], required=True)
 parser.add_argument("--method", choices=["dense", "moe", "context_aware", "context_distributed"], required=True)
-parser.add_argument("--c", type=int, choices=[2, 3, 5], default=2, help="contexts per client (fl only)")
 #Pilot values (marked (pilot) in NOTES.md)
 parser.add_argument("--lr", type=float, default=None)
 parser.add_argument("--rounds", type=int, default=100)
@@ -28,12 +28,11 @@ parser.add_argument("--ckpt", default=None, help="run dir to resume from")
 parser.add_argument("--benchmark", action="store_true", help="pilot step 1: memory and images/s per batch size")
 args = parser.parse_args()
 assert not (args.method == "context_distributed" and args.setting == "centralized"), "context_distributed has no centralized version"
-assert not (args.method == "context_distributed" and args.c == 5), "context_distributed equals context_aware at c = 5"
 
-#Paths (devkit COCO export, see NOTES.md step 0; file names depend on the devkit's Python version)
-ZOD_ROOT   = "/project/home/p201222/zod"
-TRAIN_JSON = f"{ZOD_ROOT}/coco/zod_full_Anonymization.BLUR_train.json"
-VAL_JSON   = f"{ZOD_ROOT}/coco/zod_full_Anonymization.BLUR_val.json"
+#Paths: devkit COCO export resized by zod_resize.py (see NOTES.md step 0)
+ZOD_ROOT   = "data"  # relative to the repo (git-ignored), scripts are run from the repo root
+TRAIN_JSON = f"{ZOD_ROOT}/coco_1333/train.json"
+VAL_JSON   = f"{ZOD_ROOT}/coco_1333/val.json"
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -46,6 +45,8 @@ batch_size = args.batch_size
 #Federated
 num_clients = 20
 client_frac = 0.4
+#A weather is a client's context (and gives it that expert) with at least this many frames
+min_context_frames = 1
 local_epochs = 1
 num_rounds = args.rounds
 server_lr = 5e-3
@@ -53,19 +54,25 @@ server_betas = (0.9, 0.99)
 server_eps = 1e-5
 #0.07 at batch 64 in the ImageNet-100 FL runs, linearly scaled (also Faster R-CNN's 0.02 at batch 16)
 base_lr = args.lr if args.lr is not None else 0.07 * batch_size / 64
-start_lr = base_lr / 10
-end_lr = 1e-6
-warmup_rounds = num_rounds // 10  # 10%, as in the ImageNet-100 FL runs
 
 #Centralized
 num_epochs = args.epochs
 #ConvNeXt detection recipe: 2e-4 at batch 16, linearly scaled to batch_size per GPU x 4 GPUs
 central_lr = args.lr if args.lr is not None else 2e-4 * (batch_size * 4) / 16
 weight_decay = 0.05
-warmup_epochs = 1
 
-#MoE: one expert per road type
-num_experts = len(ZOD.road_types)
+#LR schedule, Detectron2 3x standard: linear warmup from 0.001x over 1000 iterations,
+#then x0.1 at 210k and 250k of 270k iterations (78% and 93% of training), in rounds or epochs.
+#Federated has no standard: per-iteration warmup over the first 1% of rounds (~1% of training, as centralized)
+warmup_iters = 1000
+warmup_rounds = 0.01 * num_rounds
+lr_steps = (210 / 270, 250 / 270)
+lr_gamma = 0.1
+num_steps = num_rounds if args.setting == "fl" else num_epochs
+milestones = [round(f * num_steps) for f in lr_steps]
+
+#MoE: one expert per weather
+num_experts = len(ZOD.weathers)
 top_k = 1
 mlp_ratio = 2
 capacity_ratio = 1.0
@@ -90,7 +97,6 @@ cfg = {
     "seed": seed,
     "setting": args.setting,
     "method": args.method,
-    "contexts_per_client": args.c if args.setting == "fl" else None,
     "fed": {
         "agg": "context_expert_fedadam" if args.method == "context_distributed" else "fedadam",
         "server_lr": server_lr,
@@ -105,11 +111,12 @@ cfg = {
     },
     "optim": {
         "name": "sgd_nesterov" if args.setting == "fl" else "adamw",
-        "sched": "lin_warmup_cosine_annealing",
+        "sched": "detectron2_warmup_multistep",
         "base_lr": base_lr if args.setting == "fl" else central_lr,
-        "start_lr": start_lr,
-        "end_lr": end_lr,
-        "warmup": warmup_rounds if args.setting == "fl" else warmup_epochs,
+        "warmup": {"rounds": warmup_rounds} if args.setting == "fl" else {"iters": warmup_iters},
+        "warmup_factor": 0.001,
+        "milestones": milestones,
+        "gamma": lr_gamma,
         "num_epochs": num_epochs if args.setting == "centralized" else None,
         "kwargs": opt_kwargs,
     },
@@ -117,7 +124,7 @@ cfg = {
         "dataset": "zod_frames_full_blur",
         "train_json": TRAIN_JSON,
         "val_json": VAL_JSON,
-        "contexts": ZOD.road_types,
+        "contexts": ZOD.weathers,
         "classes": ZOD.classes,
         "batch_size": batch_size,
         "train_short_side": [640, 800],
@@ -158,11 +165,23 @@ def model_fn():
     return convnext_moe_detector_fn(num_experts, top_k, mlp_ratio, capacity_ratio,
                                     num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware)
 
+def lr_factor(step):
+    return lr_gamma ** sum(step >= m for m in milestones)
+
 def scheduler_fn(optimizer):
-    return SequentialLR(optimizer, schedulers=[
-        LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs),
-        CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=end_lr),
-    ], milestones=[warmup_epochs])
+    #The warmup runs per iteration inside train_client. Closed form (not MultiStepLR, which scales
+    #the current LR), so a resumed optimizer with an already decayed LR is not decayed twice
+    return LambdaLR(optimizer, lr_factor)
+
+def client_table(train, clients):
+    rows = []
+    for c in clients:
+        days = [train.days[i] for i in c.subset]
+        counts = Counter(train.contexts[i] for i in c.subset)
+        rows.append({"cid": c.cid, "car": train.cars[c.subset[0]], "period": [min(days), max(days)], "frames": len(c.subset),
+                     "weather_frames": {w: counts[i] for i, w in enumerate(ZOD.weathers)},
+                     "contexts": [ZOD.weathers[i] for i in c.contexts]})
+    return rows
 
 def benchmark(train, steps=50):
     model = compile_model(model_fn().to(device))
@@ -190,18 +209,20 @@ if __name__ == "__main__":
         benchmark(train)
         raise SystemExit
 
+    clients = None
+    if args.setting == "fl":
+        clients = init_clients_zod(train, num_clients=num_clients, batch_size=batch_size,
+                                   dl_kwargs=dl_kwargs, min_frames=min_context_frames)
+        cfg["data"]["clients"] = client_table(train, clients)
     cfg["data"]["context_counts"] = {"train": zod_context_counts(train), "val": zod_context_counts(val)}
-    name = f"zod_{args.setting}_{args.method}" + (f"_c{args.c}" if args.setting == "fl" else "")
+    name = f"zod_{args.setting}_{args.method}"
     #All torchrun ranks need the same run dir, so name it after the Slurm job when there is one
     run_id = f"{name}_{os.environ['SLURM_JOB_ID']}" if "SLURM_JOB_ID" in os.environ else None
     ctx = None if args.ckpt else init_run(name, cfg, run_id=run_id)
 
     if args.setting == "fl":
-        clients = init_clients_zod(train, c=args.c, num_clients=num_clients, batch_size=batch_size,
-                                   dl_kwargs=dl_kwargs, seed=seed)
         val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, collate_fn=ZOD.collate, **val_dl_kwargs)
-        lr_sched = lr_schedule(base_lr=base_lr, warmup_rounds=warmup_rounds,
-                               total_rounds=num_rounds, start_lr=start_lr, end_lr=end_lr)
+        lr_sched = [base_lr * lr_factor(r) for r in range(num_rounds)]
 
         fl_loop(clients=clients,
                 model_fn=model_fn,
@@ -218,7 +239,8 @@ if __name__ == "__main__":
                 num_gpus=4,
                 eval_every=5,
                 agg_fn=context_expert_fedadam if args.method == "context_distributed" else fedadam,
-                ckpt_path=args.ckpt)
+                ckpt_path=args.ckpt,
+                warmup_rounds=warmup_rounds)
     else:
         train_centralized_ddp(
             model_fn=model_fn,
@@ -235,6 +257,7 @@ if __name__ == "__main__":
             eval_every=2,
             amp_dtype=torch.bfloat16,
             ckpt_path=args.ckpt,
+            warmup_iters=warmup_iters,
             batch_size=batch_size,
             **dl_kwargs,
         )

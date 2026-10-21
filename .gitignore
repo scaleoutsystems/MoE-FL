@@ -218,5 +218,6 @@ sweep/*
 runs_atto/*
 .vscode
 NOTES.md
+.claude
 
 weather_augmentations/*.npy

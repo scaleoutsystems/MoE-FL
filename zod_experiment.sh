@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=128
 
 #Usage, arguments are passed through to zod_experiment.py:
-#  sbatch zod_experiment.sh --setting fl --method context_distributed --c 2
+#  sbatch zod_experiment.sh --setting fl --method context_distributed
 #  sbatch zod_experiment.sh --setting centralized --method context_aware
 #  sbatch zod_experiment.sh --setting fl --method moe --benchmark
 #Resume after the time limit: add --ckpt runs/<run dir>

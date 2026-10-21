@@ -8,9 +8,10 @@ timm
 #Multi GPU training
 ray
 
-#ZOD detection (devkit 0.8 breaks with dataclass-wizard 1.0)
+#ZOD detection (devkit 0.8 breaks with dataclass-wizard 1.0 and with tqdm 4.70.0)
 zod
 dataclass-wizard<1.0
+tqdm!=4.70.0
 pycocotools
 
 # Plotting

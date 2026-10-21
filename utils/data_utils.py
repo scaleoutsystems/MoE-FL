@@ -1,6 +1,7 @@
 import os
 import json
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import torch
 from PIL import Image
 from torchvision.datasets import ImageNet
@@ -95,50 +96,86 @@ class WeatherImageNetSubset(ImageNetSubset):
         return img, label, weather
 
 class ZOD(Dataset):
-    """ZOD Frames 2D detection from the devkit COCO export, with the road type as context.
+    """ZOD Frames 2D detection from the devkit COCO export, with the weather as context.
 
-    Returns (image, target, context): image is a float tensor at short side `short_side`
-    (long side capped at `max_size`), target holds boxes (xyxy, in that image's pixels),
+    Expects a JSON written by zod_resize.py (images at short side `short_side`, long side
+    capped at `max_size`). Returns (image, target, context): image is a float tensor,
+    target holds boxes (xyxy, scaled from the original pixels to the image's),
     labels and the COCO image id. Crowd ("Unclear") boxes are left out, they are only
-    ignore regions for evaluation against the original COCO JSON.
+    ignore regions for evaluation.
     """
 
     #Context index = position in this list = expert id 
-    road_types = ["city", "arterial-urban", "highway", "arterial-rural", "smaller-rural"]
+    weathers = ["clear", "cloudy", "rain", "fog", "snow"]
     #Detection label = position + 1, 0 is background
     classes = ["Vehicle", "VulnerableVehicle", "Pedestrian"]
 
     def __init__(self, coco_json, dataset_root, train=False, short_side=800, max_size=1333,
-                 version="full"):
+                 drop_cars=("bravo",)):
         self.coco_json = coco_json  # ground truth for evaluate_zod
+        #Image paths in the JSON are relative to its directory (absolute ones are kept as they are)
+        self.image_dir = os.path.dirname(os.path.abspath(coco_json))
         with open(coco_json) as f:
             coco = json.load(f)
         cat_to_label = {c["id"]: self.classes.index(c["name"]) + 1 for c in coco["categories"]}
 
-        self.images = coco["images"]
+        #Weather, car and day per frame from the cached metadata (see load_metadata)
+        meta = {int(r["id"]): r for r in self.load_metadata(dataset_root)}
+        #Frames of dropped cars (bravo: too few frames for a client) are excluded everywhere
+        splits = {meta[img["id"]]["split"] for img in coco["images"]}
+        assert len(splits) == 1, f"{coco_json} mixes the splits {splits}"
+        self.images = [img for img in coco["images"] if meta[img["id"]]["car"] not in drop_cars]
+        self.contexts = [self.weathers.index(meta[img["id"]]["weather"]) for img in self.images]
+        self.cars = [meta[img["id"]]["car"] for img in self.images]
+        self.days = [meta[img["id"]]["time"][:10] for img in self.images]
+
+        size = {img["id"]: (img["width"], img["height"]) for img in coco["images"]}
         boxes = defaultdict(list)
         for a in coco["annotations"]:
+            if a["iscrowd"]:
+                continue
             x, y, w, h = a["bbox"]
-            if not a["iscrowd"] and w > 0 and h > 0:  # degenerate boxes crash Faster R-CNN
-                boxes[a["image_id"]].append((x, y, x + w, y + h, cat_to_label[a["category_id"]]))
+            #Clip to the image as Detectron2 does (annotations of cut-off objects extend beyond it);
+            #empty boxes crash Faster R-CNN. Evaluation still uses the unclipped ground truth
+            img_w, img_h = size[a["image_id"]]
+            x1, y1, x2, y2 = max(x, 0), max(y, 0), min(x + w, img_w), min(y + h, img_h)
+            if x2 > x1 and y2 > y1:
+                boxes[a["image_id"]].append((x1, y1, x2, y2, cat_to_label[a["category_id"]]))
         self.boxes = [boxes[img["id"]] for img in self.images]
-        self.contexts = self._load_road_types(dataset_root, [img["id"] for img in self.images], version)
 
         self.train = train
         self.short_side = short_side
         self.max_size = max_size
 
-    def _load_road_types(self, dataset_root, frame_ids, version):
-        #Imported here so classification runs don't need the zod devkit
-        from zod import ZodFrames
-        zod_frames = ZodFrames(dataset_root, version)
-        contexts = []
-        for frame_id in frame_ids:
-            road_type = zod_frames[frame_id].metadata.road_type.lower().replace("_", "-").replace(" ", "-")
-            if road_type not in self.road_types:
-                raise ValueError(f"Frame {frame_id}: unknown road type {road_type!r}, expected one of {self.road_types}")
-            contexts.append(self.road_types.index(road_type))
-        return contexts
+    @staticmethod
+    def load_metadata(root):
+        """One row per frame (id, split, time, car, country, weather), read from
+        single_frames/<id>/metadata.json without the devkit and cached in <root>/zod_metadata.json."""
+        cache = os.path.join(root, "zod_metadata.json")
+        if os.path.exists(cache):
+            with open(cache) as f:
+                return json.load(f)
+        with open(os.path.join(root, "trainval-frames-full.json")) as f:
+            split_of = {frame["id"]: split for split, frames in json.load(f).items() for frame in frames}
+        def read(frame_id):
+            with open(os.path.join(root, "single_frames", frame_id, "metadata.json")) as f:
+                m = json.load(f)
+            return {"id": frame_id, "split": split_of[frame_id], "time": m["time"], "car": m["collection_car"],
+                    "country": m["country_code"], "weather": ZOD.weather_category(m["scraped_weather"])}
+        with ThreadPoolExecutor(32) as ex:
+            rows = list(ex.map(read, sorted(split_of)))
+        with open(cache, "w") as f:
+            json.dump(rows, f)
+        return rows
+
+    @staticmethod
+    def weather_category(scraped_weather):
+        """ZOD paper's 5 categories"""
+        weather = scraped_weather.removesuffix("-day").removesuffix("-night")
+        weather = "clear" if weather in ("partly-cloudy", "wind") else weather
+        if weather not in ZOD.weathers:
+            raise ValueError(f"Unknown weather {scraped_weather!r}")
+        return weather
 
     def __len__(self):
         return len(self.images)
@@ -149,11 +186,9 @@ class ZOD(Dataset):
         scale = min(self.short_side / min(w, h), self.max_size / max(w, h))
         new_w, new_h = round(w * scale), round(h * scale)
 
-        img = Image.open(info["file_name"])
-        #Let the JPEG decoder skip work: decodes at the smallest of 1/2, 1/4, 1/8 scale
-        #that is still >= the target size, then resize the rest of the way on the CPU
-        img.draft("RGB", (new_w, new_h))
-        img = img.convert("RGB").resize((new_w, new_h), Image.BILINEAR)
+        #Images are pre-resized by zod_resize.py, the boxes are still in original pixels
+        img = Image.open(os.path.join(self.image_dir, info["file_name"])).convert("RGB")
+        assert img.size == (new_w, new_h), f"{info['file_name']} is {img.size}, expected {(new_w, new_h)}: run zod_resize.py"
         image = TF.to_tensor(img)
 
         boxes = torch.tensor([b[:4] for b in self.boxes[idx]], dtype=torch.float32).reshape(-1, 4)

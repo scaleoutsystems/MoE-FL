@@ -4,8 +4,7 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset, Subset
 from .data_utils import WeatherImageNetSubset, ZOD
 import ctypes
-from collections import defaultdict
-from itertools import combinations
+from collections import defaultdict, Counter
 import re
 
 #We have to force free the RAM
@@ -420,31 +419,48 @@ def _sample_contexts(dataset):
         return [dataset.weather_types.index(w) for w in dataset.weathers]
     return None
 
-def init_clients_zod(dataset, c, num_clients, batch_size, dl_kwargs, seed=42):
-    """ZOD clients holding c road types each. Every combination of c road types is given to
-    the same number of clients, and each road type's frames are split evenly at random among
-    the clients holding it, so every frame is used exactly once."""
-    assert isinstance(dataset, ZOD)
-    num_contexts = len(dataset.road_types)
-    combos = list(combinations(range(num_contexts), c))
-    assert num_clients % len(combos) == 0, (
-        f"{num_clients} clients can't be split evenly over {len(combos)} combinations of {c} contexts"
-    )
-    client_contexts = [combo for combo in combos for _ in range(num_clients // len(combos))]
+def split_by_car_and_time(cars, days, num_clients):
+    """Natural ZOD clients: one car during one period. Clients are allocated to the cars in
+    proportion to their frames (largest remainder, cars that get none are dropped), and each
+    car's frames are cut into that many consecutive periods of about equal size, only between
+    days. cars, days ("YYYY-MM-DD"): one entry per frame. Returns frame indices per client."""
+    frames_per_car = Counter(cars)
+    quota = {car: n / len(cars) * num_clients for car, n in frames_per_car.items()}
+    alloc = {car: int(q) for car, q in quota.items()}
+    for car in sorted(quota, key=lambda car: quota[car] - alloc[car], reverse=True)[:num_clients - sum(alloc.values())]:
+        alloc[car] += 1
 
-    frame_contexts = np.array(dataset.contexts)
-    rng = np.random.default_rng(seed)
-    splits = [[] for _ in range(num_clients)]
-    for ctx in range(num_contexts):
-        holders = [cid for cid, combo in enumerate(client_contexts) if ctx in combo]
-        idxs = rng.permutation(np.flatnonzero(frame_contexts == ctx))
-        for cid, chunk in zip(holders, np.array_split(idxs, len(holders))):
-            splits[cid].extend(chunk.tolist())
+    splits = []
+    for car in sorted(alloc, key=lambda car: -frames_per_car[car]):
+        k = alloc[car]
+        if k == 0:
+            continue
+        idxs = sorted((i for i, c in enumerate(cars) if c == car), key=lambda i: days[i])
+        car_days = np.array([days[i] for i in idxs])
+        unique_days, counts = np.unique(car_days, return_counts=True)
+        cum = np.cumsum(counts)
+        #Last day of each period: the day boundary closest to each equal-size quantile
+        cut_days = [unique_days[np.argmin(np.abs(cum - len(idxs) * j / k))] for j in range(1, k)]
+        assert len(set(cut_days)) == k - 1, f"{car}: too few days for {k} clients"
+        period = np.searchsorted(cut_days, car_days, side="left")
+        splits += [[i for i, p in zip(idxs, period) if p == j] for j in range(k)]
+    return splits
+
+def init_clients_zod(dataset, num_clients, batch_size, dl_kwargs, min_frames=1):
+    """The natural ZOD clients (split_by_car_and_time). A client's contexts are the weathers
+    with at least min_frames frames in its data."""
+    assert isinstance(dataset, ZOD)
+    splits = split_by_car_and_time(dataset.cars, dataset.days, num_clients)
+    assert sum(map(len, splits)) == len(dataset), "a car without a client: add it to ZOD(drop_cars)"
 
     dl_kwargs = {**dl_kwargs, "collate_fn": ZOD.collate}
-    return [Client(cid=cid, subset=idxs, num_samples=len(idxs), dataset=dataset, transform=None,
-                   dl_kwargs=dl_kwargs, batch_size=batch_size, contexts=list(client_contexts[cid]))
-            for cid, idxs in enumerate(splits)]
+    clients = []
+    for cid, idxs in enumerate(splits):
+        counts = Counter(dataset.contexts[i] for i in idxs)
+        contexts = [ctx for ctx in range(len(dataset.weathers)) if counts[ctx] >= min_frames]
+        clients.append(Client(cid=cid, subset=idxs, num_samples=len(idxs), dataset=dataset, transform=None,
+                              dl_kwargs=dl_kwargs, batch_size=batch_size, contexts=contexts))
+    return clients
 
 def init_clients(dataset, num_clients, batch_size, dl_kwargs, transform,
                  seed=42, shuffle=True, dirichlet_alpha=None):

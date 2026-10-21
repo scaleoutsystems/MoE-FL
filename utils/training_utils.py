@@ -57,7 +57,7 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
                           loss_fn, eval_loss_fn, scheduler_fn,
                           mix_transform, ctx, opt_kwargs,
                           num_epochs=300, eval_every=5,
-                          amp_dtype=torch.bfloat16, ckpt_path=None,
+                          amp_dtype=torch.bfloat16, ckpt_path=None, warmup_iters=0,
                           batch_size=512, num_workers=4, **dl_kwargs):
 
     #Long timeout: for ZOD, rank 0 evaluates the full val set while the others wait
@@ -107,7 +107,8 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
             print(f"\n=== Epoch {epoch} ===")
 
         hist = train_client(model, train_loader, device, optimizer, loss_fn, scaler, amp_dtype,
-                            num_epochs=1, log=False, mix_transform=mix_transform)[0]
+                            num_epochs=1, log=False, mix_transform=mix_transform,
+                            warmup=(epoch, warmup_iters / len(train_loader)) if warmup_iters else None)[0]
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
@@ -174,12 +175,18 @@ def train_centralized_ddp(model_fn, opt_fn, dataset, val_dataset,
 
 def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 num_epochs = 1,log = True,mix_transform=None,
-                fedprox = False,mu=0.0, snap = None):
+                fedprox = False,mu=0.0, snap = None, warmup=None):
     #snap is a frozen global model only needed when fedprox enabled
+    #warmup = (earlier calls, warmup length in calls), calls being rounds / epochs (may be fractional):
+    #linear warmup from 0.001x as in Detectron2, per iteration, counted in this loader's steps per call
     model.train()
     history = []
 
     has_aux = hasattr(getattr(model, "module", model), "get_aux_loss")  # DDP wraps the model
+    if warmup is not None:
+        steps = len(loader) * num_epochs
+        it, warmup_iters = warmup[0] * steps, warmup[1] * steps
+        base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
     for epoch in range(num_epochs):
         running_base  = torch.zeros((), device=device)
@@ -206,6 +213,13 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 x, y = mix_transform(x, y)
 
             optimizer.zero_grad(set_to_none=True)
+
+            if warmup is not None:
+                if it <= warmup_iters:
+                    factor = 0.001 + 0.999 * it / warmup_iters
+                    for pg, lr in zip(optimizer.param_groups, base_lrs):
+                        pg["lr"] = lr * factor
+                it += 1
 
             #Tesla T4 uses f16
             #A100 uses bfloat16
@@ -294,6 +308,11 @@ def train_client(model,loader,device,optimizer,loss_fn, scaler, amp_dtype,
                 parts.append(f"acc: {epoch_acc:.4f}")
             print(" - ".join(parts))
 
+    #A call that ends inside the warmup must not leave a warmed-down LR for the scheduler
+    if warmup is not None:
+        for pg, lr in zip(optimizer.param_groups, base_lrs):
+            pg["lr"] = lr
+
     return history
 
 @torch.no_grad()
@@ -363,7 +382,7 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
 @torch.no_grad()
 def evaluate_zod(model, loader, device):
     """COCO box AP on a ZOD split, as in the ZOD paper (crowd boxes are ignore regions, size
-    buckets in original pixels): overall, per class and per road type, in percent."""
+    buckets in original pixels): overall, per class and per weather, in percent."""
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
     quiet = lambda: contextlib.redirect_stdout(io.StringIO())  # pycocotools prints a lot
@@ -390,7 +409,7 @@ def evaluate_zod(model, loader, device):
                         for box, label, score in zip(boxes.tolist(), out["labels"].tolist(), out["scores"].tolist())]
     if not results:  # no detections at all (e.g. early rounds): every AP is 0, same keys as below
         keys = ["AP", "AP50", "AP75", "APs", "APm", "APl"] + [f"AP/{c}" for c in ZOD.classes]
-        return dict.fromkeys(keys + [f"{m}/{rt}" for rt in ZOD.road_types for m in ("AP", "AP50")], 0.0)
+        return dict.fromkeys(keys + [f"{m}/{w}" for w in ZOD.weathers for m in ("AP", "AP50")], 0.0)
 
     with quiet():
         dt = gt.loadRes(results)
@@ -408,28 +427,28 @@ def evaluate_zod(model, loader, device):
     for k, cat_id in enumerate(E.params.catIds):
         p = E.eval["precision"][:, :, k, 0, -1]
         metrics[f"AP/{gt.cats[cat_id]['name']}"] = 100 * float(p[p > -1].mean()) if (p > -1).any() else float("nan")
-    for ctx, road_type in enumerate(ZOD.road_types):
+    for ctx, weather in enumerate(ZOD.weathers):
         ids = [img["id"] for img, c in zip(dataset.images, dataset.contexts) if c == ctx]
         if ids:
             E = coco_eval(ids)
-            metrics[f"AP/{road_type}"], metrics[f"AP50/{road_type}"] = pct(E.stats[0]), pct(E.stats[1])
+            metrics[f"AP/{weather}"], metrics[f"AP50/{weather}"] = pct(E.stats[0]), pct(E.stats[1])
     return metrics
 
 def zod_context_counts(dataset):
-    """Per road type: frames, boxes per class and per COCO size bucket (original pixels, crowd boxes excluded)."""
+    """Per weather: frames, boxes per class and per COCO size bucket (original pixels, crowd boxes excluded)."""
     with open(dataset.coco_json) as f:
         coco = json.load(f)
     cat_names = {c["id"]: c["name"] for c in coco["categories"]}
-    road_type_of = {img["id"]: ZOD.road_types[c] for img, c in zip(dataset.images, dataset.contexts)}
-    counts = {rt: defaultdict(int) for rt in ZOD.road_types}
-    for rt in road_type_of.values():
-        counts[rt]["frames"] += 1
+    weather_of = {img["id"]: ZOD.weathers[c] for img, c in zip(dataset.images, dataset.contexts)}
+    counts = {w: defaultdict(int) for w in ZOD.weathers}
+    for w in weather_of.values():
+        counts[w]["frames"] += 1
     for a in coco["annotations"]:
         if not a["iscrowd"]:
-            c = counts[road_type_of[a["image_id"]]]
+            c = counts[weather_of[a["image_id"]]]
             c[cat_names[a["category_id"]]] += 1
             c["small" if a["area"] < 32 ** 2 else "medium" if a["area"] < 96 ** 2 else "large"] += 1
-    return {rt: dict(c) for rt, c in counts.items()}
+    return {w: dict(c) for w, c in counts.items()}
 
 @torch.no_grad()
 def compute_routing_metrics(round_idx, routing_model, global_params,
@@ -513,7 +532,7 @@ class ClientWorker:
 
     def train(self, client,  opt_fn, opt_kwargs, lr_r,
               train_loss_fn, local_epochs, mix_transform,
-              fedprox, mu, snap_cpu, collect_expert_stats):
+              fedprox, mu, snap_cpu, collect_expert_stats, warmup):
 
         optimizer = opt_fn(self.model, opt_kwargs)
         set_lr(optimizer, lr_r)
@@ -527,7 +546,7 @@ class ClientWorker:
             train_loss_fn, self.scaler, self.amp_dtype,
             num_epochs=local_epochs, log=False,
             mix_transform=mix_transform,
-            fedprox=fedprox, mu=mu, snap=snap,
+            fedprox=fedprox, mu=mu, snap=snap, warmup=warmup,
         )
 
         result = {
@@ -546,7 +565,7 @@ class ClientWorker:
     
 def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_kwargs,
                     lr_r, train_loss_fn, local_epochs, mix_transform,
-                    fedprox, mu, snap, collect_expert_stats, num_gpus, **_):
+                    fedprox, mu, snap, collect_expert_stats, num_gpus, warmup, **_):
 
     snap_cpu = [p.detach().cpu() for p in snap] if (fedprox and snap is not None) else None
     results = []
@@ -563,7 +582,7 @@ def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_
             workers[rank].train.remote(
                 client, opt_fn, opt_kwargs, lr_r,
                 train_loss_fn, local_epochs, mix_transform,
-                fedprox, mu, snap_ref, collect_expert_stats
+                fedprox, mu, snap_ref, collect_expert_stats, warmup
             )
             for rank, client in enumerate(batch)
         ]
@@ -579,7 +598,7 @@ def run_clients_multi_gpu(selected_clients, workers, global_params, opt_fn, opt_
 def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_fn, opt_kwargs,
                                lr_r, train_loss_fn, local_epochs, mix_transform,
                                fedprox, mu, snap, scaler, amp_dtype, device,
-                               collect_expert_stats, **_):
+                               collect_expert_stats, warmup, **_):
     
     results = []
     selected_clients[0].prefetch()
@@ -600,9 +619,9 @@ def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_
             train_loss_fn, scaler, amp_dtype,
             num_epochs=local_epochs, log=True,
             mix_transform=mix_transform,
-            fedprox=fedprox, mu=mu, snap=snap
+            fedprox=fedprox, mu=mu, snap=snap, warmup=warmup
         )
-        
+
         result = {
             "cid": client.cid,
             "num_samples": client.num_samples,
@@ -625,7 +644,7 @@ def run_clients_io_bottleneck(selected_clients, local_model, global_params, opt_
 def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, opt_kwargs,
                             lr_r, train_loss_fn, local_epochs, mix_transform,
                             fedprox, mu, snap, scaler, amp_dtype, device,
-                            collect_expert_stats, **_):
+                            collect_expert_stats, warmup, **_):
     results = []
 
     for client in selected_clients:
@@ -642,9 +661,9 @@ def run_clients_single_gpu(selected_clients,local_model, global_params, opt_fn, 
             train_loss_fn, scaler, amp_dtype,
             num_epochs=local_epochs, log=True,
             mix_transform=mix_transform,
-            fedprox=fedprox, mu=mu, snap=snap
+            fedprox=fedprox, mu=mu, snap=snap, warmup=warmup
         )
-        
+
         result = {
             "cid": client.cid,
             "num_samples": client.num_samples,
@@ -677,7 +696,7 @@ def fl_loop(clients,model_fn,opt_fn,
             eval_every=5, agg_fn=fedavg,
             amp_dtype=torch.bfloat16, 
             num_gpus=1, io_bottleneck=False,
-            ckpt_path=None):
+            ckpt_path=None, warmup_rounds=0):
     
     client_frac = fl_kwargs['client_frac']
     num_clients = fl_kwargs['num_clients']
@@ -785,7 +804,8 @@ def fl_loop(clients,model_fn,opt_fn,
             scaler=scaler,
             amp_dtype=amp_dtype,
             device=device,
-            collect_expert_stats=collect_expert_stats
+            collect_expert_stats=collect_expert_stats,
+            warmup=(r, warmup_rounds) if warmup_rounds else None,
         )
 
         client_states = [r["state"] for r in results]

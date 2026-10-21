@@ -57,8 +57,10 @@ base_lr = args.lr if args.lr is not None else 0.07 * batch_size / 64
 
 #Centralized
 num_epochs = args.epochs
-#ConvNeXt detection recipe: 2e-4 at batch 16, linearly scaled to batch_size per GPU x 4 GPUs
-central_lr = args.lr if args.lr is not None else 2e-4 * (batch_size * 4) / 16
+#torchrun sets WORLD_SIZE (GPUs); effective batch = batch_size per GPU x GPUs
+world_size = int(os.environ.get("WORLD_SIZE", 1))
+#ConvNeXt detection recipe: 2e-4 at batch 16, linearly scaled to the effective batch
+central_lr = args.lr if args.lr is not None else 2e-4 * (batch_size * world_size) / 16
 weight_decay = 0.05
 
 #LR schedule, Detectron2 3x standard: linear warmup from 0.001x over 1000 iterations,
@@ -127,6 +129,8 @@ cfg = {
         "contexts": ZOD.weathers,
         "classes": ZOD.classes,
         "batch_size": batch_size,
+        "world_size": world_size if args.setting == "centralized" else None,
+        "effective_batch_size": batch_size * world_size if args.setting == "centralized" else batch_size,
         "train_short_side": [640, 800],
         "test_short_side": 800,
         "max_size": 1333,
@@ -186,17 +190,19 @@ def client_table(train, clients):
 def benchmark(train, steps=50):
     model = compile_model(model_fn().to(device))
     optimizer = opt_fn(model, opt_kwargs)
-    for bs in (4, 8, 12, 16):
+    for bs in (20, 24, 28, 32):
         try:
-            #Warm-up pass compiles for the new shapes, then a timed pass
-            warmup = DataLoader(Subset(train, range(bs * 5)), batch_size=bs, collate_fn=ZOD.collate, **dl_kwargs)
+            #Warm-up pass compiles for the new shapes (the random image scales give several padded sizes,
+            #so it is long enough that few recompiles are left for the timed pass), then a timed pass
+            warmup = DataLoader(Subset(train, range(bs * 20)), batch_size=bs, collate_fn=ZOD.collate, **dl_kwargs)
             timed = DataLoader(Subset(train, range(bs * steps)), batch_size=bs, collate_fn=ZOD.collate, **dl_kwargs)
             train_client(model, warmup, device, optimizer, None, None, torch.bfloat16, log=False)
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); t = time.time()
             train_client(model, timed, device, optimizer, None, None, torch.bfloat16, log=False)
             torch.cuda.synchronize()
             print(f"batch {bs:2d}: {bs * steps / (time.time() - t):.1f} images/s, "
-                  f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
+                  f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB allocated, "
+                  f"{torch.cuda.max_memory_reserved() / 1e9:.1f} GB reserved (closer to nvidia-smi)")
         except torch.cuda.OutOfMemoryError:
             print(f"batch {bs:2d}: out of memory")
             break
@@ -216,9 +222,11 @@ if __name__ == "__main__":
         cfg["data"]["clients"] = client_table(train, clients)
     cfg["data"]["context_counts"] = {"train": zod_context_counts(train), "val": zod_context_counts(val)}
     name = f"zod_{args.setting}_{args.method}"
-    #All torchrun ranks need the same run dir, so name it after the Slurm job when there is one
     run_id = f"{name}_{os.environ['SLURM_JOB_ID']}" if "SLURM_JOB_ID" in os.environ else None
-    ctx = None if args.ckpt else init_run(name, cfg, run_id=run_id)
+    #torchrun starts one process per GPU but only rank 0 logs and checkpoints, so only it creates the run dir
+    #(RANK is not set for single-process runs)
+    is_rank0 = int(os.environ.get("RANK", 0)) == 0
+    ctx = init_run(name, cfg, run_id=run_id) if is_rank0 and not args.ckpt else None
 
     if args.setting == "fl":
         val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, collate_fn=ZOD.collate, **val_dl_kwargs)
@@ -236,7 +244,7 @@ if __name__ == "__main__":
                 ctx=ctx,
                 fl_kwargs=cfg["fed"],
                 opt_kwargs=opt_kwargs,
-                num_gpus=4,
+                num_gpus=2,
                 eval_every=5,
                 agg_fn=context_expert_fedadam if args.method == "context_distributed" else fedadam,
                 ckpt_path=args.ckpt,

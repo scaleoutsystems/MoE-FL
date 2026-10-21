@@ -1,29 +1,42 @@
+# Needed by zod_experiment.py. Pinned to the newest stable releases (checked 2026-10-21).
 # Deep Learning Core
-torch
-torchvision
-numpy
-scipy
-timm
+#(torch.amp.GradScaler needs torch >= 2.3. The default Linux wheel is the CUDA 13.0 build: it needs
+#a driver that supports CUDA 13, e.g. 580. For an older driver install both from
+#https://download.pytorch.org/whl/cu126 first)
+torch==2.14.1
+torchvision==0.29.1
+#numpy and Pillow: the newest releases need Python 3.12 / 3.11, the markers pick the newest one that fits
+numpy==2.5.4; python_version >= "3.12"
+numpy==2.2.6; python_version < "3.12"
+timm==1.0.30
 
 #Multi GPU training
-ray
+ray==2.59.0
 
-#ZOD detection (devkit 0.8 breaks with dataclass-wizard 1.0 and with tqdm 4.70.0)
-zod
-dataclass-wizard<1.0
-tqdm!=4.70.0
-pycocotools
-
-# Plotting
-matplotlib
+#ZOD detection: COCO evaluation (the ZOD devkit is not needed for training)
+pycocotools==2.0.11
 
 #Image loading
-Pillow
+Pillow==13.0.0; python_version >= "3.11"
+Pillow==12.3.0; python_version < "3.11"
 
-#Weather augmentation
-transformers
-diffusers
-tqdm
-opencv-python
-accelerate
-bitsandbytes
+# --- Not needed by zod_experiment.py. Uncomment for the other scripts ---
+
+# scipy
+
+#ZOD data preparation only (zod download, zod generate coco, zod_clients.py plots);
+#devkit 0.8 breaks with dataclass-wizard 1.0 and with tqdm 4.70.0
+# zod
+# dataclass-wizard<1.0
+# tqdm!=4.70.0
+
+# Plotting (zod_clients.py, utils/plotting_utils.py)
+# matplotlib
+
+#Weather augmentation (weather_augmentations/)
+# transformers
+# diffusers
+# tqdm
+# opencv-python
+# accelerate
+# bitsandbytes

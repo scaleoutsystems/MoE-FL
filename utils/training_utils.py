@@ -379,6 +379,48 @@ def evaluate(model, loader, device, loss_fn, num_classes=100, moe_stats=False):
         
     return result
 
+def _accumulate_routing(layers, stats, contexts, sizes, padded, preferred):
+    """Add the last eval batch's routing to `stats` (per MoE layer: kept[weather, expert] token counts,
+    preferred[expert] token counts, and the number of real tokens). Padding is not input: a token counts when
+    the centre of its patch lies inside the real image (images sit in the top left of the zero-padded batch).
+    `sizes`: real (height, width) per image. `preferred`: per layer, every token's top-1 expert by the router's
+    gate logits, before the capacity limit."""
+    H, W = padded
+    real_hw = torch.tensor(sizes)
+    for n, m in layers:
+        expert_id, token_idx, T = m._last_routing  # the tokens the experts processed (after the capacity limit)
+        per_image = T // len(sizes)  # tokens are ordered image by image, row by row
+        stride = round((H * W / per_image) ** 0.5)
+        cols = W // stride
+        tokens = torch.arange(T)
+        image, pos = tokens // per_image, tokens % per_image
+        real = ((pos // cols + 0.5) * stride < real_hw[image, 0]) & ((pos % cols + 0.5) * stride < real_hw[image, 1])
+        s = stats[n]
+        s["real"] += int(real.sum())
+        s["preferred"] += torch.bincount(preferred[n][real], minlength=m.num_experts)
+        kept = real[token_idx]
+        idx = (contexts[token_idx // per_image] * m.num_experts + expert_id)[kept]
+        s["kept"].view(-1).scatter_add_(0, idx, torch.ones_like(idx))
+
+def _routing_metrics(stats):
+    """Per MoE layer, named as in the ImageNet runs (all over real val tokens, routed without context labels):
+    load_balance/<layer>: the share of tokens whose top-1 expert is each expert, before any capacity limit
+      (the ImageNet `global_load_balance`: argmax of the router's gate logits)
+    expert_activation_pct/<layer>: the share of the tokens the experts processed that each expert got
+      (the ImageNet `expert_activation_pct`; differs from load_balance only with the standard MoE's capacity limit)
+    routing/<layer>/<weather>: the same as expert_activation_pct per weather (ImageNet's class_expert_activation_pct
+      with the weather as the label)
+    tokens_dropped/<layer>: the share of real tokens no expert processed (0 without the capacity limit)"""
+    share = lambda counts: (counts / counts.sum().clamp(min=1)).tolist()
+    metrics = {}
+    for n, s in stats.items():
+        for i, w in enumerate(ZOD.weathers):
+            metrics[f"routing/{n}/{w}"] = share(s["kept"][i])
+        metrics[f"expert_activation_pct/{n}"] = share(s["kept"].sum(0))
+        metrics[f"load_balance/{n}"] = share(s["preferred"])
+        metrics[f"tokens_dropped/{n}"] = 1 - s["kept"].sum().item() / max(s["real"], 1)
+    return metrics
+
 @torch.no_grad()
 def evaluate_zod(model, loader, device):
     """COCO box AP on a ZOD split, as in the ZOD paper (crowd boxes are ignore regions, size
@@ -396,20 +438,39 @@ def evaluate_zod(model, loader, device):
     name_to_cat = {c["name"]: c["id"] for c in gt.dataset["categories"]}
 
     model.eval()
+    #Expert use: in eval mode every MoE layer keeps (expert, token) of its last forward in _last_routing
+    moe_layers = [(n, m) for n, m in model.base.named_modules() if m in model._moe_modules] if hasattr(model, "_moe_modules") else []
+    stats = {n: {"kept": torch.zeros(len(ZOD.weathers), m.num_experts, dtype=torch.long),
+                 "preferred": torch.zeros(m.num_experts, dtype=torch.long), "real": 0} for n, m in moe_layers}
+    #Hooks: the detector's transform gives the real image sizes and the padded batch size, and each router's gate
+    #gives every token's preferred expert (argmax of its logits, as in the ImageNet routing metrics)
+    batch, preferred, hooks = {}, {}, []
+    if moe_layers:
+        hooks.append(model.base.transform.register_forward_hook(
+            lambda mod, args, out: batch.update(sizes=out[0].image_sizes, padded=tuple(out[0].tensors.shape[-2:]))))
+        hooks += [m.router.gate.register_forward_hook(lambda mod, args, out, n=n: preferred.update({n: out.argmax(-1).cpu()}))
+                  for n, m in moe_layers]
     results = []
-    for images, targets, _ in loader:
-        outputs = model([img.to(device, non_blocking=True) for img in images])
-        for img, target, out in zip(images, targets, outputs):
-            #Predictions are in the loaded image's pixels, ground truth in original pixels
-            info = gt.imgs[target["image_id"]]
-            boxes = out["boxes"].cpu() * torch.tensor([info["width"] / img.shape[-1], info["height"] / img.shape[-2]] * 2)
-            boxes[:, 2:] -= boxes[:, :2]  # xyxy -> xywh
-            results += [{"image_id": target["image_id"], "category_id": name_to_cat[ZOD.classes[label - 1]],
-                         "bbox": box, "score": score}
-                        for box, label, score in zip(boxes.tolist(), out["labels"].tolist(), out["scores"].tolist())]
+    try:
+        for images, targets, contexts in loader:
+            outputs = model([img.to(device, non_blocking=True) for img in images])
+            if moe_layers:
+                _accumulate_routing(moe_layers, stats, contexts, batch["sizes"], batch["padded"], preferred)
+            for img, target, out in zip(images, targets, outputs):
+                #Predictions are in the loaded image's pixels, ground truth in original pixels
+                info = gt.imgs[target["image_id"]]
+                boxes = out["boxes"].cpu() * torch.tensor([info["width"] / img.shape[-1], info["height"] / img.shape[-2]] * 2)
+                boxes[:, 2:] -= boxes[:, :2]  # xyxy -> xywh
+                results += [{"image_id": target["image_id"], "category_id": name_to_cat[ZOD.classes[label - 1]],
+                             "bbox": box, "score": score}
+                            for box, label, score in zip(boxes.tolist(), out["labels"].tolist(), out["scores"].tolist())]
+    finally:
+        for h in hooks:
+            h.remove()
+    routing = _routing_metrics(stats)
     if not results:  # no detections at all (e.g. early rounds): every AP is 0, same keys as below
         keys = ["AP", "AP50", "AP75", "APs", "APm", "APl"] + [f"AP/{c}" for c in ZOD.classes]
-        return dict.fromkeys(keys + [f"{m}/{w}" for w in ZOD.weathers for m in ("AP", "AP50")], 0.0)
+        return {**dict.fromkeys(keys + [f"{m}/{w}" for w in ZOD.weathers for m in ("AP", "AP50")], 0.0), **routing}
 
     with quiet():
         dt = gt.loadRes(results)
@@ -432,7 +493,7 @@ def evaluate_zod(model, loader, device):
         if ids:
             E = coco_eval(ids)
             metrics[f"AP/{weather}"], metrics[f"AP50/{weather}"] = pct(E.stats[0]), pct(E.stats[1])
-    return metrics
+    return {**metrics, **routing}
 
 def zod_context_counts(dataset):
     """Per weather: frames, boxes per class and per COCO size bucket (original pixels, crowd boxes excluded)."""
@@ -444,7 +505,8 @@ def zod_context_counts(dataset):
     for w in weather_of.values():
         counts[w]["frames"] += 1
     for a in coco["annotations"]:
-        if not a["iscrowd"]:
+        #The JSON also holds the frames the dataset dropped (bravo), they are not counted
+        if not a["iscrowd"] and a["image_id"] in weather_of:
             c = counts[weather_of[a["image_id"]]]
             c[cat_names[a["category_id"]]] += 1
             c["small" if a["area"] < 32 ** 2 else "medium" if a["area"] < 96 ** 2 else "large"] += 1

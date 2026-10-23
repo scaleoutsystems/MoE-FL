@@ -1,15 +1,14 @@
 import os
-import time
 import random
 import argparse
 from collections import Counter
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 
 from utils.fl_utils import init_clients_zod, fedadam, context_expert_fedadam
-from utils.training_utils import fl_loop, train_centralized_ddp, train_client, compile_model, zod_context_counts
+from utils.training_utils import fl_loop, train_centralized_ddp, zod_context_counts
 from utils.experiment_tracking import init_run
 from utils.data_utils import ZOD
 from custom_modules.convnext_detection import convnext_detector_fn, convnext_moe_detector_fn
@@ -23,9 +22,9 @@ parser.add_argument("--method", choices=["dense", "moe", "context_aware", "conte
 parser.add_argument("--lr", type=float, default=None)
 parser.add_argument("--rounds", type=int, default=100)
 parser.add_argument("--epochs", type=int, default=36)
-parser.add_argument("--batch-size", type=int, default=8)
+#16 per GPU: Faster R-CNN's standard batch, ~28 GB allocated / 36 GB reserved on an A100 40GB
+parser.add_argument("--batch-size", type=int, default=16)
 parser.add_argument("--ckpt", default=None, help="run dir to resume from")
-parser.add_argument("--benchmark", action="store_true", help="pilot step 1: memory and images/s per batch size")
 args = parser.parse_args()
 assert not (args.method == "context_distributed" and args.setting == "centralized"), "context_distributed has no centralized version"
 
@@ -76,7 +75,8 @@ milestones = [round(f * num_steps) for f in lr_steps]
 #MoE: one expert per weather
 num_experts = len(ZOD.weathers)
 top_k = 1
-mlp_ratio = 2
+mlp_ratio = 4  # matches ConvNeXt's MLP, so every expert starts from the pretrained one
+pretrained = True
 capacity_ratio = 1.0
 bpr = args.method == "moe"
 context_aware = args.method in ("context_aware", "context_distributed")
@@ -138,7 +138,7 @@ cfg = {
     },
     "model": {
         "detector": "faster_rcnn_fpn_p2-p6",
-        "backbone": "convnext_tiny_scratch",
+        "backbone": "convnext_tiny_imagenet1k" if pretrained else "convnext_tiny_scratch",
         "moe": None if args.method == "dense" else {
             "routing": "context_logit_ce" if context_aware else "noisy_top_k",
             "expert_placement": "last block of stages 3 and 4",
@@ -165,9 +165,10 @@ def opt_fn(model, opt_kwargs):
 
 def model_fn():
     if args.method == "dense":
-        return convnext_detector_fn(num_classes=len(ZOD.classes) + 1)
+        return convnext_detector_fn(num_classes=len(ZOD.classes) + 1, pretrained=pretrained)
     return convnext_moe_detector_fn(num_experts, top_k, mlp_ratio, capacity_ratio,
-                                    num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware)
+                                    num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware,
+                                    pretrained=pretrained)
 
 def lr_factor(step):
     return lr_gamma ** sum(step >= m for m in milestones)
@@ -187,33 +188,11 @@ def client_table(train, clients):
                      "contexts": [ZOD.weathers[i] for i in c.contexts]})
     return rows
 
-def benchmark(train, steps=50):
-    model = compile_model(model_fn().to(device))
-    optimizer = opt_fn(model, opt_kwargs)
-    for bs in (20, 24, 28, 32):
-        try:
-            #Warm-up pass compiles for the new shapes (the random image scales give several padded sizes,
-            #so it is long enough that few recompiles are left for the timed pass), then a timed pass
-            warmup = DataLoader(Subset(train, range(bs * 20)), batch_size=bs, collate_fn=ZOD.collate, **dl_kwargs)
-            timed = DataLoader(Subset(train, range(bs * steps)), batch_size=bs, collate_fn=ZOD.collate, **dl_kwargs)
-            train_client(model, warmup, device, optimizer, None, None, torch.bfloat16, log=False)
-            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); t = time.time()
-            train_client(model, timed, device, optimizer, None, None, torch.bfloat16, log=False)
-            torch.cuda.synchronize()
-            print(f"batch {bs:2d}: {bs * steps / (time.time() - t):.1f} images/s, "
-                  f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB allocated, "
-                  f"{torch.cuda.max_memory_reserved() / 1e9:.1f} GB reserved (closer to nvidia-smi)")
-        except torch.cuda.OutOfMemoryError:
-            print(f"batch {bs:2d}: out of memory")
-            break
-
 if __name__ == "__main__":
-    train = ZOD(TRAIN_JSON, ZOD_ROOT, train=True)
+    #bravo's ~300 frames are too few for a client. Both settings drop them from training so centralized
+    #trains on exactly the clients' data, val is always complete
+    train = ZOD(TRAIN_JSON, ZOD_ROOT, train=True, drop_cars=("bravo",))
     val = ZOD(VAL_JSON, ZOD_ROOT)
-
-    if args.benchmark:
-        benchmark(train)
-        raise SystemExit
 
     clients = None
     if args.setting == "fl":

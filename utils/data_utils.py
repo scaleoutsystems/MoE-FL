@@ -111,7 +111,7 @@ class ZOD(Dataset):
     classes = ["Vehicle", "VulnerableVehicle", "Pedestrian"]
 
     def __init__(self, coco_json, dataset_root, train=False, short_side=800, max_size=1333,
-                 drop_cars=("bravo",)):
+                 drop_cars=()):
         self.coco_json = coco_json  # ground truth for evaluate_zod
         #Image paths in the JSON are relative to its directory (absolute ones are kept as they are)
         self.image_dir = os.path.dirname(os.path.abspath(coco_json))
@@ -121,7 +121,7 @@ class ZOD(Dataset):
 
         #Weather, car and day per frame from the cached metadata (see load_metadata)
         meta = {int(r["id"]): r for r in self.load_metadata(dataset_root)}
-        #Frames of dropped cars (bravo: too few frames for a client) are excluded everywhere
+        #Frames of dropped cars are excluded (training drops bravo: too few frames for a client)
         splits = {meta[img["id"]]["split"] for img in coco["images"]}
         assert len(splits) == 1, f"{coco_json} mixes the splits {splits}"
         self.images = [img for img in coco["images"] if meta[img["id"]]["car"] not in drop_cars]

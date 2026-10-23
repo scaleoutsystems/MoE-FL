@@ -8,8 +8,8 @@ set -eo pipefail
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
-$SUDO apt-get update -qq
-$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+$SUDO apt-get update
+$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     tmux nano unzip rsync build-essential
 
 for cmd in tmux nano unzip rsync gcc g++; do

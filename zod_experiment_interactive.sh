@@ -72,7 +72,7 @@ python -c "import torch, torchvision; print('torch', torch.__version__, '| torch
 echo "Starting experiment with arguments: $@"
 
 # Execute the run using the global python/torchrun installation
-if [[ " $* " == *" --setting centralized "* && " $* " != *" --benchmark "* ]]; then
+if [[ " $* " == *" --setting centralized "* ]]; then
     torchrun --nproc_per_node=2 zod_experiment.py "$@"
 else
     python zod_experiment.py "$@"

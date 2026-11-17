@@ -96,7 +96,7 @@ class WeatherImageNetSubset(ImageNetSubset):
         return img, label, weather
 
 class ZOD(Dataset):
-    """ZOD Frames 2D detection from the devkit COCO export, with the weather as context.
+    """ZOD Frames 2D detection from the devkit COCO export, with the weather or the ground (road surface and sky) as context.
 
     Expects a JSON written by zod_resize.py (images at short side `short_side`, long side
     capped at `max_size`). Returns (image, target, context): image is a float tensor,
@@ -107,11 +107,13 @@ class ZOD(Dataset):
 
     #Context index = position in this list = expert id 
     weathers = ["clear", "cloudy", "rain", "fog", "snow"]
+    #The other context (`context="ground"`): annotated road condition first, on a dry road the scraped sky
+    grounds = ["dry-clear", "dry-cloudy", "wet-road", "snow-ground"]
     #Detection label = position + 1, 0 is background
     classes = ["Vehicle", "VulnerableVehicle", "Pedestrian"]
 
     def __init__(self, coco_json, dataset_root, train=False, short_side=800, max_size=1333,
-                 drop_cars=()):
+                 drop_cars=(), context="weather"):
         self.coco_json = coco_json  # ground truth for evaluate_zod
         #Image paths in the JSON are relative to its directory (absolute ones are kept as they are)
         self.image_dir = os.path.dirname(os.path.abspath(coco_json))
@@ -125,7 +127,9 @@ class ZOD(Dataset):
         splits = {meta[img["id"]]["split"] for img in coco["images"]}
         assert len(splits) == 1, f"{coco_json} mixes the splits {splits}"
         self.images = [img for img in coco["images"] if meta[img["id"]]["car"] not in drop_cars]
-        self.contexts = [self.weathers.index(meta[img["id"]]["weather"]) for img in self.images]
+        #context_names[context index] is the context's name, the index is the expert id
+        self.context_names = {"weather": self.weathers, "ground": self.grounds}[context]
+        self.contexts = [self.context_names.index(meta[img["id"]][context]) for img in self.images]
         self.cars = [meta[img["id"]]["car"] for img in self.images]
         self.days = [meta[img["id"]]["time"][:10] for img in self.images]
 
@@ -149,24 +153,37 @@ class ZOD(Dataset):
 
     @staticmethod
     def load_metadata(root):
-        """One row per frame (id, split, time, car, country, weather), read from
+        """One row per frame (id, split, time, car, country, weather, ground), read from
         single_frames/<id>/metadata.json without the devkit and cached in <root>/zod_metadata.json."""
         cache = os.path.join(root, "zod_metadata.json")
         if os.path.exists(cache):
             with open(cache) as f:
-                return json.load(f)
+                rows = json.load(f)
+            if "ground" in rows[0]:  # caches from before the ground context are rebuilt
+                return rows
         with open(os.path.join(root, "trainval-frames-full.json")) as f:
             split_of = {frame["id"]: split for split, frames in json.load(f).items() for frame in frames}
         def read(frame_id):
             with open(os.path.join(root, "single_frames", frame_id, "metadata.json")) as f:
                 m = json.load(f)
             return {"id": frame_id, "split": split_of[frame_id], "time": m["time"], "car": m["collection_car"],
-                    "country": m["country_code"], "weather": ZOD.weather_category(m["scraped_weather"])}
+                    "country": m["country_code"], "weather": ZOD.weather_category(m["scraped_weather"]),
+                    "ground": ZOD.ground_label(m["road_condition"], m["scraped_weather"])}
         with ThreadPoolExecutor(32) as ex:
             rows = list(ex.map(read, sorted(split_of)))
         with open(cache, "w") as f:
             json.dump(rows, f)
         return rows
+
+    @staticmethod
+    def ground_label(road_condition, scraped_weather):
+        """Ground context: the annotated road surface first (snow, wet), on a dry road the scraped sky (clear-day and
+        clear-night vs everything else, partly cloudy included)"""
+        if road_condition not in ("normal", "wet", "snow"):
+            raise ValueError(f"Unknown road condition {road_condition!r}")
+        if road_condition != "normal":
+            return "snow-ground" if road_condition == "snow" else "wet-road"
+        return "dry-clear" if scraped_weather in ("clear-day", "clear-night") else "dry-cloudy"
 
     @staticmethod
     def weather_category(scraped_weather):

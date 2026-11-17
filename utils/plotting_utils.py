@@ -224,6 +224,51 @@ def plot_weather_expert_heatmap(save_path, va, layer_names, moe_indices, weather
         plt.close(fig)
 
 
+def plot_zod_spatial_expert_heatmaps(save_path, record, layer_names, cmap="rocket"):
+    """2x2 grid, one panel per expert: its share of the tokens at every grid position, one figure per MoE layer.
+    `record`: the result of `evaluate_zod(model, loader, device, routing_analysis=True)` on a checkpoint."""
+    save_path = Path(save_path)
+    for layer_name in layer_names:
+        data = np.array(record[f"spatial/{layer_name}"])
+        grid_h, grid_w = record[f"spatial_grid/{layer_name}"]
+        #Positions in the padding of the batch are never counted (all experts 0): drop those rows and columns
+        grid = data.reshape(len(data), grid_h, grid_w)
+        used = grid.sum(0) > 0
+        rows, cols = np.flatnonzero(used.any(1)), np.flatnonzero(used.any(0))
+        data = grid[:, rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+        grid_h, grid_w = data.shape[1:]
+        data = data.reshape(len(data), -1)
+        n_experts = len(data)
+        n_rows = (n_experts + 1) // 2
+
+        #Figure sized from the grid's aspect so the panels fill the full width, horizontal colorbar underneath
+        gap, label_h, cbar_gap, cbar_h, cbar_text, m = 0.05, 0.17, 0.05, 0.07, 0.3, 0.03  # inches
+        pw = (SPATIAL_W - 2 * m - gap) / 2
+        ph = pw * grid_h / grid_w
+        panels_h = n_rows * (ph + label_h) + (n_rows - 1) * gap
+        fig_h = m + panels_h + cbar_gap + cbar_h + cbar_text
+        fig = plt.figure(figsize=(SPATIAL_W, fig_h))
+
+        for e in range(n_experts):
+            r, c = divmod(e, 2)
+            ax = fig.add_axes([(m + c * (pw + gap)) / SPATIAL_W, 1 - (m + r * (ph + label_h + gap) + ph) / fig_h,
+                               pw / SPATIAL_W, ph / fig_h])
+            im = ax.imshow(data[e].reshape(grid_h, grid_w), cmap=cmap, vmin=0.1, vmax=0.4,
+                           interpolation="nearest", aspect="auto")
+            ax.set_xlabel(f"$E_{{{e}}}$", fontsize=FS_TICK, labelpad=2)
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+
+        cax = fig.add_axes([0.2, (cbar_text) / fig_h, 0.6, cbar_h / fig_h])
+        cbar = fig.colorbar(im, cax=cax, orientation="horizontal")
+        cbar.set_ticks([0.1, 0.2, 0.3, 0.4])
+        _style_cbar(cbar)
+
+        fig.savefig(save_path / f"zod_spatial_expert_activation_{layer_name.replace('.', '_')}.png", dpi=600)
+        plt.close(fig)
+
+
 def plot_spatial_expert_heatmap_final(save_path, va, layer_names, moe_indices, grid_sizes,
                                       n_experts=4, cmap="rocket", **_ignored):
     save_path = Path(save_path)

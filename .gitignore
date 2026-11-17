@@ -219,5 +219,6 @@ runs_atto/*
 .vscode
 NOTES.md
 .claude
+*.sh
 
 weather_augmentations/*.npy

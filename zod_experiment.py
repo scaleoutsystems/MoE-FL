@@ -18,9 +18,10 @@ from custom_modules.convnext_detection import convnext_detector_fn, convnext_moe
 parser = argparse.ArgumentParser()
 parser.add_argument("--setting", choices=["fl", "centralized"], required=True)
 parser.add_argument("--method", choices=["dense", "moe", "context_aware", "context_distributed"], required=True)
-#Pilot values (marked (pilot) in NOTES.md)
+#What an expert is for: ground = road surface and sky (dry-clear, dry-cloudy, wet-road, snow-ground), weather = the scraped weather
+parser.add_argument("--context", choices=["ground", "weather"], default="ground")
 parser.add_argument("--lr", type=float, default=None)
-parser.add_argument("--rounds", type=int, default=100)
+parser.add_argument("--rounds", type=int, default=50)
 parser.add_argument("--epochs", type=int, default=36)
 #16 per GPU: Faster R-CNN's standard batch, ~28 GB allocated / 36 GB reserved on an A100 40GB
 parser.add_argument("--batch-size", type=int, default=16)
@@ -45,8 +46,8 @@ batch_size = args.batch_size
 num_clients = 20
 client_frac = 0.4
 #A weather is a client's context (and gives it that expert) with at least this many frames
-min_context_frames = 1
-local_epochs = 1
+min_context_frac = 0.005
+local_epochs = 2
 num_rounds = args.rounds
 server_lr = 5e-3
 server_betas = (0.9, 0.99)
@@ -73,7 +74,8 @@ num_steps = num_rounds if args.setting == "fl" else num_epochs
 milestones = [round(f * num_steps) for f in lr_steps]
 
 #MoE: one expert per weather
-num_experts = len(ZOD.weathers)
+context_names = ZOD.grounds if args.context == "ground" else ZOD.weathers
+num_experts = len(context_names)
 top_k = 1
 mlp_ratio = 4  # matches ConvNeXt's MLP, so every expert starts from the pretrained one
 pretrained = True
@@ -126,7 +128,8 @@ cfg = {
         "dataset": "zod_frames_full_blur",
         "train_json": TRAIN_JSON,
         "val_json": VAL_JSON,
-        "contexts": ZOD.weathers,
+        "context": args.context,
+        "contexts": context_names,
         "classes": ZOD.classes,
         "batch_size": batch_size,
         "world_size": world_size if args.setting == "centralized" else None,
@@ -166,9 +169,10 @@ def opt_fn(model, opt_kwargs):
 def model_fn():
     if args.method == "dense":
         return convnext_detector_fn(num_classes=len(ZOD.classes) + 1, pretrained=pretrained)
-    return convnext_moe_detector_fn(num_experts, top_k, mlp_ratio, capacity_ratio,
-                                    num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware,
-                                    pretrained=pretrained)
+    model = convnext_moe_detector_fn(num_experts, top_k, mlp_ratio, capacity_ratio,
+                                     num_classes=len(ZOD.classes) + 1, bpr=bpr, context_aware=context_aware,
+                                     pretrained=pretrained)
+    return model
 
 def lr_factor(step):
     return lr_gamma ** sum(step >= m for m in milestones)
@@ -184,23 +188,23 @@ def client_table(train, clients):
         days = [train.days[i] for i in c.subset]
         counts = Counter(train.contexts[i] for i in c.subset)
         rows.append({"cid": c.cid, "car": train.cars[c.subset[0]], "period": [min(days), max(days)], "frames": len(c.subset),
-                     "weather_frames": {w: counts[i] for i, w in enumerate(ZOD.weathers)},
-                     "contexts": [ZOD.weathers[i] for i in c.contexts]})
+                     "context_frames": {w: counts[i] for i, w in enumerate(train.context_names)},
+                     "contexts": [train.context_names[i] for i in c.contexts]})
     return rows
 
 if __name__ == "__main__":
     #bravo's ~300 frames are too few for a client. Both settings drop them from training so centralized
     #trains on exactly the clients' data, val is always complete
-    train = ZOD(TRAIN_JSON, ZOD_ROOT, train=True, drop_cars=("bravo",))
-    val = ZOD(VAL_JSON, ZOD_ROOT)
+    train = ZOD(TRAIN_JSON, ZOD_ROOT, train=True, drop_cars=("bravo",), context=args.context)
+    val = ZOD(VAL_JSON, ZOD_ROOT, context=args.context)
 
     clients = None
     if args.setting == "fl":
         clients = init_clients_zod(train, num_clients=num_clients, batch_size=batch_size,
-                                   dl_kwargs=dl_kwargs, min_frames=min_context_frames)
+                           dl_kwargs=dl_kwargs, min_frac=min_context_frac)
         cfg["data"]["clients"] = client_table(train, clients)
     cfg["data"]["context_counts"] = {"train": zod_context_counts(train), "val": zod_context_counts(val)}
-    name = f"zod_{args.setting}_{args.method}"
+    name = f"zod_{args.setting}_{args.method}" + ("_ground" if args.context == "ground" else "")
     run_id = f"{name}_{os.environ['SLURM_JOB_ID']}" if "SLURM_JOB_ID" in os.environ else None
     #torchrun starts one process per GPU but only rank 0 logs and checkpoints, so only it creates the run dir
     #(RANK is not set for single-process runs)
@@ -224,7 +228,7 @@ if __name__ == "__main__":
                 fl_kwargs=cfg["fed"],
                 opt_kwargs=opt_kwargs,
                 num_gpus=2,
-                eval_every=5,
+                eval_every=2,
                 agg_fn=context_expert_fedadam if args.method == "context_distributed" else fedadam,
                 ckpt_path=args.ckpt,
                 warmup_rounds=warmup_rounds)

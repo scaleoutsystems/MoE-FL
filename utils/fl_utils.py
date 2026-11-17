@@ -446,9 +446,10 @@ def split_by_car_and_time(cars, days, num_clients):
         splits += [[i for i, p in zip(idxs, period) if p == j] for j in range(k)]
     return splits
 
-def init_clients_zod(dataset, num_clients, batch_size, dl_kwargs, min_frames=1):
+def init_clients_zod(dataset, num_clients, batch_size, dl_kwargs, min_frac=0.005):
     """The natural ZOD clients (split_by_car_and_time). A client's contexts are the weathers
-    with at least min_frames frames in its data."""
+    making up at least min_frac of its frames (inclusive). Frames of the other weathers stay in
+    the client's data, their tokens are dispatched to the best allowed expert."""
     assert isinstance(dataset, ZOD)
     splits = split_by_car_and_time(dataset.cars, dataset.days, num_clients)
     assert sum(map(len, splits)) == len(dataset), "a car without a client: add it to ZOD(drop_cars)"
@@ -457,7 +458,7 @@ def init_clients_zod(dataset, num_clients, batch_size, dl_kwargs, min_frames=1):
     clients = []
     for cid, idxs in enumerate(splits):
         counts = Counter(dataset.contexts[i] for i in idxs)
-        contexts = [ctx for ctx in range(len(dataset.weathers)) if counts[ctx] >= min_frames]
+        contexts = [ctx for ctx in range(len(dataset.context_names)) if counts[ctx] >= min_frac * len(idxs)]
         clients.append(Client(cid=cid, subset=idxs, num_samples=len(idxs), dataset=dataset, transform=None,
                               dl_kwargs=dl_kwargs, batch_size=batch_size, contexts=contexts))
     return clients

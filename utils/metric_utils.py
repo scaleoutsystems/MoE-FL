@@ -1,7 +1,9 @@
+import math
 import torch
 import time
 import numpy as np
 from fvcore.nn import FlopCountAnalysis, flop_count_table
+from .fl_utils import _expert_id_of_key
 
 @torch.no_grad()
 def measure_ms_per_sample(model,loader,device,
@@ -64,6 +66,44 @@ def fedavg_comm_cost_gb(model, num_clients, num_rounds, participation, bytes_per
         "total_per_round_GB": to_gb(total_per_round),
         "total_training_GB": to_gb(total_training),
     }
+
+def context_expert_comm_cost_gb(model, client_contexts, num_rounds, participation, bytes_per_param=2,
+                                download="held", sampled=None):
+    shared, expert = 0, {}
+    for name, p in model.named_parameters():
+        e = _expert_id_of_key(name)
+        if e is None:
+            shared += p.numel()
+        else:
+            expert[e] = expert.get(e, 0) + p.numel()
+    full = shared + sum(expert.values())
+    held = np.array([shared + sum(expert[e] for e in ctx) for ctx in client_contexts], dtype=float)
+    up = held * bytes_per_param
+    down = (held if download == "held" else np.full(len(held), full, dtype=float)) * bytes_per_param
+    cost = up + down  # one client, one round, bytes
+
+    N = len(held)
+    m = max(1, math.ceil(participation * N))
+    #Sum of m clients drawn without replacement: mean m * mean(cost), variance with the finite-population factor
+    var_round = m * cost.var() * (N - m) / (N - 1) if N > 1 else 0.0
+    to_gb = lambda x: x / 1e9
+    result = {
+        "Parameters": full,
+        "shared_parameters": shared,
+        "client_parameters_min_mean_max": (int(held.min()), int(held.mean()), int(held.max())),
+        "model_GB": to_gb(full * bytes_per_param),
+        "downlink_per_round_GB": to_gb(m * down.mean()),
+        "uplink_per_round_GB": to_gb(m * up.mean()),
+        "total_per_round_GB": to_gb(m * cost.mean()),
+        "total_per_round_std_GB": to_gb(math.sqrt(var_round)),
+        "total_training_GB": to_gb(num_rounds * m * cost.mean()),
+        "total_training_std_GB": to_gb(math.sqrt(num_rounds * var_round)),
+        "fedavg_total_training_GB": to_gb(num_rounds * m * 2 * full * bytes_per_param),
+    }
+    if sampled is not None:
+        result["realized_rounds"] = len(sampled)
+        result["realized_total_training_GB"] = to_gb(sum(cost[c] for round_clients in sampled for c in round_clients))
+    return result
 
 def count_flops(model,inputs,show_table=False,max_depth=4):
     model.eval()

@@ -1,8 +1,6 @@
-# Needed by zod_experiment.py. Pinned to the newest stable releases (checked 2026-10-21).
+# Needed by zod_experiment.py. 
 # Deep Learning Core
-#(torch.amp.GradScaler needs torch >= 2.3. The default Linux wheel is the CUDA 13.0 build: it needs
-#a driver that supports CUDA 13, e.g. 580. For an older driver install both from
-#https://download.pytorch.org/whl/cu126 first)
+
 torch==2.14.1
 torchvision==0.29.1
 #numpy and Pillow: the newest releases need Python 3.12 / 3.11, the markers pick the newest one that fits
@@ -19,6 +17,9 @@ pycocotools==2.0.11
 #Image loading
 Pillow==13.0.0; python_version >= "3.11"
 Pillow==12.3.0; python_version < "3.11"
+
+matplotlib
+seaborn
 
 # --- Not needed by zod_experiment.py. Uncomment for the other scripts ---
 

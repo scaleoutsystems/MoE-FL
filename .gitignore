@@ -221,4 +221,4 @@ NOTES.md
 .claude
 *.sh
 
-weather_augmentations/*.npy
+weather_augmentations/*.npy.DS_Store
